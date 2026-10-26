@@ -1,0 +1,12 @@
+runs/
+evidence/
+*.vhd
+*.raw
+*.qcow2
+*.key
+*.key.pem
+*.pfx
+*.p12
+config.json
+guest-signer.der
+guest-security-profile.json

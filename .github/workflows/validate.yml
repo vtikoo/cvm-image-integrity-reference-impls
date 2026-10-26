@@ -1,0 +1,27 @@
+name: Validate recipe
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  scripts:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate scripts, configuration, and certificate profile
+        shell: pwsh
+        run: .\tests\Test-Local.ps1
+  producer:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.18.1'
+      - name: Install producer build prerequisite
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libudev-dev
+      - name: Test and build the exact producer revision
+        run: |
+          git clone https://github.com/vtikoo/encrypt-cloud-image.git producer
+          cd producer
+          git checkout --detach 5dc3d3f85fdfa6f5bae8bc01edcbf55b2adcfabe
+          go test -v .
+          go build -trimpath .
