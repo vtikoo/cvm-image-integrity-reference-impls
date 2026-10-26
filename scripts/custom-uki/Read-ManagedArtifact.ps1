@@ -18,27 +18,11 @@ $stem = ([IO.Path]::GetFileNameWithoutExtension($OutputPath) -replace '[^a-zA-Z0
 if ($stem.Length -gt 32) { $stem = $stem.Substring(0, 32) }
 $encoded = [Text.StringBuilder]::new()
 $scriptPath = Join-Path $env:TEMP "canonical-artifact-$([Guid]::NewGuid().ToString('N')).sh"
+$reader = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\Read-ArtifactChunk.py')).Replace("`r`n", "`n")
 try {
     $index = 0
     do {
-        $script = @'
-#!/bin/bash
-set -euo pipefail
-python3 - <<'PY'
-import base64, gzip, hashlib, json, pathlib, re
-path = pathlib.Path(base64.b64decode('__PATH__').decode())
-data = path.read_bytes()
-assert not re.search(rb'-----BEGIN [A-Z ]*PRIVATE KEY-----', data)
-encoded = base64.b64encode(gzip.compress(data, mtime=0)).decode()
-index = __INDEX__
-chunks = (len(encoded) + 2999) // 3000
-assert index < chunks
-print(json.dumps(dict(index=index, chunks=chunks, sha256=hashlib.sha256(data).hexdigest(),
-                     payload=encoded[index*3000:(index+1)*3000])))
-print('MANAGED_ARTIFACT_CHUNK_READY')
-PY
-'@
-        $script = $script.Replace('__PATH__', $remote).Replace('__INDEX__', [string]$index)
+        $script = "#!/bin/bash`nset -euo pipefail`npython3 - '$remote' '$index' <<'PY'`n$reader`nPY"
         [IO.File]::WriteAllText($scriptPath, $script + "`n", [Text.UTF8Encoding]::new($false))
         $name = "read-$stem-$index"
         & (Join-Path $PSScriptRoot 'Invoke-ManagedGuest.ps1') -Script $scriptPath -VmName $VmName `

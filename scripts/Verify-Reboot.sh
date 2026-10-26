@@ -37,4 +37,18 @@ df -B1 /run/mnt/writable-tmp
 df -i /run/mnt/writable-tmp
 grep -E 'Shmem:|MemAvailable:|SwapTotal:|SwapFree:' /proc/meminfo
 systemctl --failed --no-pager
+python3 - <<'PY'
+import json
+import pathlib
+import subprocess
+
+assert not pathlib.Path('/canonical-volatile-reference').exists()
+assert not pathlib.Path('/var/tmp/canonical-smoke-reference').exists()
+assert not pathlib.Path('/var/tmp/canonical-reference-evidence.json').exists()
+result = dict(boot_id=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+              volatile_marker_absent=True, smoke_workload_absent=True,
+              first_boot_evidence_absent=True, full_lower_verification_passed=True,
+              verity_status=subprocess.check_output(['dmsetup', 'status', '--target', 'verity'], text=True).strip())
+pathlib.Path('/var/tmp/canonical-reboot-evidence.json').write_text(json.dumps(result, indent=2) + '\n')
+PY
 echo VOLATILE_REBOOT_AND_UNCHANGED_LOWER_PASSED

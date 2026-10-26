@@ -13,7 +13,7 @@ foreach ($file in Get-ChildItem -LiteralPath $root -Filter *.ps1 -Recurse) {
     if ($errors.Count) { throw "$($file.Name): $($errors | Out-String)" }
 }
 $bash = if ($IsWindows) { Join-Path $env:ProgramFiles 'Git\bin\bash.exe' } else { 'bash' }
-foreach ($file in Get-ChildItem -LiteralPath (Join-Path $root 'scripts') -Filter *.sh -Recurse) {
+foreach ($file in Get-ChildItem -LiteralPath $root -Filter *.sh -Recurse) {
     [IO.File]::ReadAllText($file.FullName).Replace("`r`n","`n") | & $bash -n
     if ($LASTEXITCODE -ne 0) { throw "Shell syntax failure: $($file.Name)" }
 }

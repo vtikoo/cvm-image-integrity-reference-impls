@@ -11,7 +11,8 @@ particular Linux distribution or writable-root configuration.
 | Canonical Ubuntu 22.04 CVM: dm-verity lower + volatile tmpfs upper | Implemented; documented below |
 | Additional writable-state configurations and distributions, such as Azure Linux | Future extensions; not implemented |
 
-The current `Deploy.ps1` entry point runs the Canonical Ubuntu/tmpfs recipe only.
+The current `deploy.sh` (Linux) and `Deploy.ps1` (PowerShell) entry points run
+the Canonical Ubuntu/tmpfs recipe only.
 New configurations can add their own distro-specific preparation and boot
 mechanisms while documenting their integrity guarantees and validation evidence.
 
@@ -37,7 +38,7 @@ The recipe deliberately pins the version that was demonstrated:
 | Producer | [fork commit `5dc3d3f`](https://github.com/vtikoo/encrypt-cloud-image/commit/5dc3d3f85fdfa6f5bae8bc01edcbf55b2adcfabe) |
 | Upstream producer starting point | PR 26, `dc393b4e94c48283ed8955f5d2623210a51c5239` |
 | Demonstrated SKU | `Standard_DC4as_v6` |
-| Controller | Windows, PowerShell 7, Azure CLI |
+| Controllers | Linux with Bash 4+; or PowerShell 7 on Windows |
 
 Subscription, names, region, and DCas_v6 size are configurable. This is not an
 automatic converter for arbitrary Ubuntu versions: kernel/module compatibility,
@@ -50,7 +51,10 @@ a fresh-account deployment of the packaged entry point is not claimed.
 
 ## Prerequisites
 
-- PowerShell 7, Azure CLI, and `tar`; Git Bash is needed for local shell syntax tests.
+- **Linux:** Bash 4+, Azure CLI, `jq`, Python 3, OpenSSL, GNU core utilities,
+  `gzip`, and `tar`. PowerShell is **not** required for deployment or cleanup.
+- **Windows:** PowerShell 7, Azure CLI, and `tar`; Git Bash is needed for local
+  shell syntax tests.
 - `az login` using an authentication flow allowed by your organization's policy.
 - An existing OpenSSH **public** key file, such as `$HOME\.ssh\id_ed25519.pub`.
   Do not supply a private key.
@@ -66,7 +70,29 @@ The default region is `westus3`; choose a region with your own quota. No
 subscription, tenant, private key, storage credential, or original run evidence
 is included in this repository.
 
-## Run
+## Run on Linux
+
+Clone this repository and review the scripts. Preview the configuration without
+Azure calls, an existing key file, or resource creation:
+
+```bash
+bash deploy.sh --subscription-id '<your-subscription-guid>' \
+  --resource-group rg-my-cvm-tmpfs --prefix mycvm \
+  --ssh-public-key "$HOME/.ssh/id_ed25519.pub" --location westus3 --plan
+```
+
+Remove `--plan` to deploy. Optional `--vm-size` and `--run-directory` correspond
+to the PowerShell parameters. The default run directory is
+`$HOME/canonical-cvm-runs/<prefix>`, outside the checkout. Existing run
+directories and existing resource groups are rejected.
+
+The Linux controller uses Azure CLI directly. It shares the guest-side UKI
+rebuild, producer/image build, upload, artifact encoder, and first-boot/reboot
+verification with the PowerShell controller, rather than invoking PowerShell.
+It preserves the two-VM cap, ownership checks, execution-state/exit-code/marker
+gates, hashed chunk retrieval, exact Gallery signer readback, and deallocation.
+
+## Run with PowerShell
 
 Clone this repository and review the scripts. Preview the derived configuration
 without Azure calls or resource creation:
@@ -117,13 +143,24 @@ the target is deallocated.
 
 ## Validation and evidence
 
+Linux controller tests use a strict local Azure CLI double, not Azure credentials:
+
+```bash
+python3 tests/test_bash.py
+```
+
+The test suite additionally uses `pwsh` to compare configuration with the
+PowerShell controller; this is a **test-only** dependency, not a Linux deployment
+dependency. CI supplies it. On Windows:
+
 ```powershell
 .\tests\Test-Local.ps1
 ```
 
 CI checks script syntax, configuration/plan guards, certificate-profile handling,
-and builds/tests the exact producer commit. CI does **not** create Azure resources
-or prove end-to-end boot.
+native Bash orchestration and failure paths against mocks, and builds/tests the
+exact producer commit. CI does **not** create Azure resources or prove end-to-end
+boot. A fresh Azure deployment driven by the Bash controller is not claimed.
 
 A successful real run additionally requires:
 
@@ -152,7 +189,18 @@ Inspect `evidence\verified-custom-uki-build.json`, `evidence\build`,
 Errors are not treated as success. A failed run requests deallocation of VMs in
 the ownership-tagged group; verify it completed. Keep evidence for diagnosis.
 Do not blindly rerun over a partial build: stateful build stages reject
-overwrites. After reviewing evidence, remove the entire failed run:
+overwrites. After reviewing evidence, remove the entire failed run on Linux:
+
+```bash
+bash cleanup.sh --run-directory "$HOME/canonical-cvm-runs/mycvm" --remove-run
+```
+
+Without `--remove-run`, `cleanup.sh` requires successful reboot/Gallery evidence,
+removes temporary build resources, and retains the deallocated reference and
+Gallery. It is intended to finish a run whose validation passed but whose
+cleanup did not complete; it does not silently resume arbitrary partial runs.
+
+With PowerShell:
 
 ```powershell
 .\scripts\custom-uki\Cleanup-CustomRun.ps1 `

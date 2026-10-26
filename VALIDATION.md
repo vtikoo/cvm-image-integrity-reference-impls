@@ -42,7 +42,17 @@ acceptance evidence; the generic repository name does not imply they are support
 certificate-profile guards, and the pinned producer's focused tests/build.
 They do not allocate Azure resources.
 
-**A new end-to-end run of this parameterized entry point is not claimed.**
+The native Linux `deploy.sh` and `cleanup.sh` use the same guest scripts.
+`tests/test_bash.py` runs on Linux with a strict local Azure CLI double that
+rejects unknown operations. It exercises the complete orchestration through
+retention, and checks Pending/exit-zero handling, terminal state/exit/marker
+requirements, startup deadlines, multi-chunk artifact integrity and private-key
+rejection, public certificate profiles, ownership-safe removal, quota failures,
+exact Gallery signer gates, and distinct reboot IDs. Configuration is compared
+with the PowerShell plan. These are controller tests, not simulated proof of
+firmware or verity correctness.
+
+**A new Azure end-to-end run of either packaged entry point is not claimed.**
 Run it in your own dedicated scope and require all acceptance evidence before
 calling your deployment successful. No source-run credentials, certificates,
 private keys, Azure resource identifiers, or raw evidence are published here.

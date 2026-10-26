@@ -88,34 +88,11 @@ try {
     $vmId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Compute/virtualMachines/$($config.helperVm)"
     Invoke-Azure @('rest','--method','patch','--url',"https://management.azure.com${vmId}?api-version=2024-07-01",
         '--body',"@$attachPath",'--headers','Content-Type=application/json','-o','none')
-    Invoke-GuestText -Name source-ready -Marker SOURCE_DISK_READY -Text @'
-#!/bin/bash
-set -euo pipefail
-for attempt in $(seq 1 60); do
-    if test -b /dev/disk/azure/scsi1/lun0; then
-        test "$(blockdev --getsize64 /dev/disk/azure/scsi1/lun0)" = 32213303296
-        echo SOURCE_DISK_READY
-        exit 0
-    fi
-    sleep 5
-done
-echo 'The source disk did not attach within five minutes.' >&2
-exit 1
-'@
+    Invoke-GuestFile -Path (Join-Path $scripts 'Wait-SourceDisk.sh') -Name source-ready -Marker SOURCE_DISK_READY
     & (Join-Path $custom 'Build-ProtectedImage.ps1') -RunDirectory $RunDirectory
     & (Join-Path $scripts 'New-PublicationScope.ps1') -RunDirectory $RunDirectory
     & (Join-Path $scripts 'Upload-Vhd.ps1') -RunDirectory $RunDirectory -ManagedChannel
-    Invoke-GuestText -Name collect-build-evidence -Marker BUILD_EVIDENCE_ARCHIVED -Text @'
-#!/bin/bash
-set -euo pipefail
-work=/var/tmp/canonical-build
-tar -czf "$work/build-evidence.tar.gz" -C "$work" evidence image-build.log \
-    producer-checksums.txt producer-go-build.txt tool-packages.txt \
-    custom-uki-1/custom-uki-build.json custom-uki-1/module-plan.txt \
-    custom-uki-1/initrd-module-plan.txt custom-uki-1/modprobe-check.txt \
-    custom-uki-1/pe-size-correction.json custom-uki-1/signer.der
-echo BUILD_EVIDENCE_ARCHIVED
-'@
+    Invoke-GuestFile -Path (Join-Path $scripts 'Collect-BuildEvidence.sh') -Name collect-build-evidence -Marker BUILD_EVIDENCE_ARCHIVED
     Read-Artifact -RemotePath /var/tmp/canonical-build/build-evidence.tar.gz -Name 'evidence\build-evidence.tar.gz'
     $buildPath = Join-Path $RunDirectory 'evidence\build'
     New-Item -ItemType Directory -Path $buildPath | Out-Null

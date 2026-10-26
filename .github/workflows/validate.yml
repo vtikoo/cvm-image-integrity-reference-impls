@@ -3,6 +3,14 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  bash:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+      - name: Exercise native Linux controllers without Azure
+        run: python3 tests/test_bash.py
   scripts:
     runs-on: windows-latest
     steps:

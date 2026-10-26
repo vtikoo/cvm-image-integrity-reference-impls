@@ -8,10 +8,10 @@ if ($rootHash -notmatch '^[0-9a-f]{64}$' -or
     $build.certificate_sha256 -notmatch '^[0-9a-f]{64}$') { throw 'Verified build hashes are required.' }
 $prefix = "#!/bin/bash`nexport POC_EXPECTED_ROOT_HASH='$rootHash'`nexport POC_EXPECTED_UKI_HASH='$($build.signed_uki_sha256)'`nexport POC_EXPECTED_CERT_SHA256='$($build.certificate_sha256)'`n"
 function Invoke-Check {
-    param([string] $FileName, [string] $Name, [string] $Marker, [string] $Suffix = '')
+    param([string] $FileName, [string] $Name, [string] $Marker)
     $body = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "..\$FileName")).Replace("`r`n", "`n")
     $script = Join-Path $RunDirectory "evidence\$Name.sh"
-    [IO.File]::WriteAllText($script, $prefix + $body + "`n" + $Suffix + "`n", [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($script, $prefix + $body + "`n", [Text.UTF8Encoding]::new($false))
     & (Join-Path $PSScriptRoot 'Invoke-ManagedGuest.ps1') -Script $script -VmName $config.targetVm `
         -RunDirectory $RunDirectory -EvidenceName $Name -SuccessMarker $Marker -TimeoutSeconds 1800
 }
@@ -39,21 +39,7 @@ do {
 } while ($true)
 & az vm restart --subscription $config.subscriptionId -g $config.resourceGroup -n $config.targetVm --only-show-errors
 if ($LASTEXITCODE -ne 0) { throw 'The target restart failed.' }
-$suffix = @'
-python3 - <<'PY'
-import json, pathlib, subprocess
-assert not pathlib.Path('/canonical-volatile-reference').exists()
-assert not pathlib.Path('/var/tmp/canonical-smoke-reference').exists()
-assert not pathlib.Path('/var/tmp/canonical-reference-evidence.json').exists()
-result = dict(boot_id=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-              volatile_marker_absent=True, smoke_workload_absent=True,
-              first_boot_evidence_absent=True, full_lower_verification_passed=True,
-              verity_status=subprocess.check_output(['dmsetup','status','--target','verity'], text=True).strip())
-pathlib.Path('/var/tmp/canonical-reboot-evidence.json').write_text(json.dumps(result, indent=2)+'\n')
-PY
-echo MANAGED_REBOOT_CHECK_PASSED
-'@
-Invoke-Check -FileName Verify-Reboot.sh -Name reference-after-reboot -Marker MANAGED_REBOOT_CHECK_PASSED -Suffix $suffix
+Invoke-Check -FileName Verify-Reboot.sh -Name reference-after-reboot -Marker VOLATILE_REBOOT_AND_UNCHANGED_LOWER_PASSED
 $afterPath = Join-Path $RunDirectory 'evidence\reference-after-reboot-verified.json'
 & (Join-Path $PSScriptRoot 'Read-ManagedArtifact.ps1') -RemotePath /var/tmp/canonical-reboot-evidence.json `
     -OutputPath $afterPath -VmName $config.targetVm -RunDirectory $RunDirectory
