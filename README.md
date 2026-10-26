@@ -1,14 +1,31 @@
-# Canonical Ubuntu CVM: verity lower + volatile tmpfs root
+# CVM Image Integrity
+
+Deployment recipes, instructions, and validation for Confidential VM image
+integrity. The common theme is enforcing and verifying image integrity, not a
+particular Linux distribution or writable-root configuration.
+
+## Configurations
+
+| Configuration | Status |
+| --- | --- |
+| Canonical Ubuntu 22.04 CVM: dm-verity lower + volatile tmpfs upper | Implemented; documented below |
+| Additional writable-state configurations and distributions, such as Azure Linux | Future extensions; not implemented |
+
+The current `Deploy.ps1` entry point runs the Canonical Ubuntu/tmpfs recipe only.
+New configurations can add their own distro-specific preparation and boot
+mechanisms while documenting their integrity guarantees and validation evidence.
+
+## Current recipe: Canonical Ubuntu with a tmpfs root
 
 Build your own image from a pinned Ubuntu 22.04 Confidential VM Marketplace
 image, publish it in **your** private Azure Compute Gallery, and deploy **your**
 Confidential VM with Secure Boot and vTPM enabled. No access to the original
 author's Azure resources or private signing keys is required.
 
-This is a **custom-initrd / custom-signed UKI proof of concept**, not a stock-UKI
+This recipe is a **custom-initrd / custom-signed UKI proof of concept**, not a stock-UKI
 demonstration or production root-filesystem attestation solution.
 
-## Supported baseline
+## Supported baseline for the current recipe
 
 The recipe deliberately pins the version that was demonstrated:
 

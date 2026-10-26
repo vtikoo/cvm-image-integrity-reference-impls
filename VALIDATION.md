@@ -1,6 +1,6 @@
 # Validation scope
 
-## Demonstrated Azure component flow
+## Demonstrated configuration: Canonical Ubuntu with a tmpfs root
 
 The component scripts from which this recipe was extracted were exercised with
 the pinned Ubuntu 22.04 CVM image, kernel, and producer source in the README:
@@ -33,6 +33,10 @@ Configuration/names, source acquisition, helper identity creation, and the
 entry-point orchestration were extracted and parameterized for this repository.
 The public producer fork commit contains the same source changes tested in the
 original run; its build metadata can produce a different binary checksum.
+
+These results apply to the Canonical Ubuntu/tmpfs configuration only. Additional
+distributions or writable-state configurations require their own documented
+acceptance evidence; the generic repository name does not imply they are supported.
 
 `tests/Test-Local.ps1` and CI cover local parsing, plan/resource naming,
 certificate-profile guards, and the pinned producer's focused tests/build.
