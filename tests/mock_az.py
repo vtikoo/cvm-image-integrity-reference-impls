@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Azure CLI double: deliberately rejects every unimplemented operation."""
 import base64
-import gzip
 import hashlib
 import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tarfile
 import urllib.parse
@@ -53,14 +53,14 @@ def vm_model(name):
 
 
 def artifact(path):
-    certificate = (fixture / "public.der").read_bytes()
     if path.endswith("custom-uki-build.json"):
+        certificate = (fixture / "public.der").read_bytes()
         return json.dumps(dict(signature_verified_with_poc_certificate=True,
                                certificate_sha256=hashlib.sha256(certificate).hexdigest(),
                                signed_uki_sha256="b"*64,
                                build_directory="/var/tmp/canonical-build/custom-uki-1")).encode()
     if path.endswith("signer.der"):
-        return certificate
+        return (fixture / "public.der").read_bytes()
     if path.endswith("build-evidence.tar.gz"):
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode="w:gz") as archive:
@@ -121,6 +121,12 @@ if args[:2] == ["vm", "restart"]:
     state["restarted"] = True
     emit()
 if args[:3] == ["vm", "run-command", "list"]:
+    if mode == "policy-commands":
+        commands = [dict(name="policy-owned", id="policy-owned")]
+        if state.get("testCommandPresent", True):
+            commands.append(dict(name="poc-old", id=resource_id(
+                "Microsoft.Compute/virtualMachines", config["targetVm"])+"/runCommands/poc-old"))
+        emit(commands)
     emit([])
 if args[:3] in (["network", "nsg", "create"], ["network", "vnet", "create"],
                  ["network", "nic", "delete"], ["network", "public-ip", "delete"],
@@ -160,6 +166,9 @@ if args and args[0] == "rest":
         emit()
     if "/runCommands/" in path:
         name = path.rsplit("/", 1)[1]
+        if method == "delete" and mode == "policy-commands" and name.startswith("poc-"):
+            state["testCommandPresent"] = False
+            emit()
         if method == "put":
             body = json.loads(pathlib.Path(value("--body")[1:]).read_text())
             script = body["properties"]["source"]["script"]
@@ -188,14 +197,17 @@ if args and args[0] == "rest":
                 remote = base64.b64decode(fields[2]).decode()
                 index = int(fields[3])
                 data = artifact(remote)
-                encoded = base64.b64encode(gzip.compress(data, mtime=0)).decode()
-                digest = hashlib.sha256(data).hexdigest()
+                local_artifact = fixture / "managed-artifact.bin"
+                local_artifact.write_bytes(data)
+                encoded_path = base64.b64encode(str(local_artifact).encode()).decode()
+                reader = pathlib.Path(__file__).resolve().parents[1] / "scripts/Read-ArtifactChunk.py"
+                encoded = subprocess.check_output([sys.executable, str(reader), encoded_path, str(index)], text=True)
+                chunk = json.loads(encoded.splitlines()[0])
                 if mode == "tamper":
-                    digest = "0"*64
+                    chunk["sha256"] = "0"*64
                 if mode == "changed-chunk" and index > 0:
-                    digest = "1"*64
-                output = json.dumps(dict(index=index, chunks=(len(encoded)+2999)//3000,
-                                         sha256=digest, payload=encoded[index*3000:(index+1)*3000]))
+                    chunk["sha256"] = "1"*64
+                output = json.dumps(chunk)
                 output += "\nMANAGED_ARTIFACT_CHUNK_READY"
             else:
                 output = markers[name.removeprefix("poc-").replace("-", "_")]

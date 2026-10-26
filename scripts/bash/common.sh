@@ -150,7 +150,9 @@ read_artifact() {
 }
 
 stage_file() {
-    printf "printf '%%s' '%s' | base64 -d > '%s'\n" "$(base64 -w0 < "$1")" "$2"
+    local payload
+    payload=$(base64 -w0 < "$1")
+    printf "printf '%%s' '%s' | base64 -d > '%s'\n" "$payload" "$2"
 }
 
 new_security_profile() {

@@ -155,6 +155,8 @@ date() {
                 result = self.function('read_artifact /var/tmp/test-artifact "$TEST_FIXTURE/output.bin"',
                                        mode=mode, check=False)
                 self.assertNotEqual(result.returncode, 0)
+                expected = "SHA256 verification" if mode == "tamper" else "changed during retrieval"
+                self.assertIn(expected, result.stderr)
                 self.assertFalse((self.fixture / "output.bin").exists())
 
     def test_artifact_overwrites_and_private_paths_rejected(self):
@@ -192,6 +194,12 @@ date() {
                            env=dict(self.env, MOCK_MODE="ownership"), check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any(call[:2] == ["group", "delete"] for call in self.calls()))
+
+    def test_only_test_managed_commands_are_deleted(self):
+        self.function("remove_test_commands", mode="policy-commands")
+        deletes = [call for call in self.calls() if "delete" in call]
+        self.assertEqual(len(deletes), 1)
+        self.assertIn("/runCommands/poc-old?", deletes[0][deletes[0].index("--url")+1])
 
     def test_cleanup_requires_reboot_proof(self):
         result = self.bash(["cleanup.sh", "--run-directory", str(self.run)], check=False)
