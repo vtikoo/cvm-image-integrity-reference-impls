@@ -1,0 +1,11 @@
+{
+  "baseImage": "MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2:3.20261022.01",
+  "imageCustomizerRepository": "https://github.com/microsoft/azure-linux-image-tools.git",
+  "imageCustomizerCommit": "ab96510020d9ae61d680ed999f71ca38bb8df784",
+  "dependencyContainer": "mcr.microsoft.com/azurelinux/imagecustomizer@sha256:8b209a70818c80acaf698220c43210752cbf6b0b2485d8f979c73cf3dea514b7",
+  "goVersion": "go1.27.3",
+  "packageSnapshotTime": "2026-10-25",
+  "targetKernel": "6.6.159.1-1.azl3",
+  "targetSystemd": "255-34.azl3",
+  "targetDracut": "102-13.azl3"
+}

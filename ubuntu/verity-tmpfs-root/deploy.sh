@@ -36,7 +36,7 @@ key=$(< "$SSH_PUBLIC_KEY")
 [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^[:space:]]+)[[:space:]][A-Za-z0-9+/]+=*([[:space:]].*)?$ ]] ||
     die 'Supply an OpenSSH public key, not private SSH/signing material.'
 RUN_DIR=$(realpath -m -- "${RUN_DIR:-$HOME/canonical-cvm-runs/$PREFIX}")
-[[ "$RUN_DIR" != "$REPO_ROOT" && "$RUN_DIR" != "$REPO_ROOT/"* ]] || die 'Run directory must be outside this repository.'
+[[ "$RUN_DIR" != "$CHECKOUT_ROOT" && "$RUN_DIR" != "$CHECKOUT_ROOT/"* ]] || die 'Run directory must be outside this repository.'
 [[ ! -e "$RUN_DIR" && ! -L "$RUN_DIR" ]] || die 'Use a new run directory; do not overwrite an earlier run.'
 mkdir -p -- "$(dirname -- "$RUN_DIR")"
 mkdir -m 700 -- "$RUN_DIR"

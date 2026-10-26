@@ -1,0 +1,101 @@
+previewFeatures:
+- uki
+- package-snapshot-time
+
+storage:
+  bootType: efi
+  disks:
+  - partitionTableType: gpt
+    partitions:
+    - id: esp
+      type: esp
+      size: 512M
+    - id: boot
+      size: 512M
+    - id: root
+      size: 8G
+    - id: roothash
+      size: 256M
+  verity:
+  - id: verityroot
+    name: root
+    dataDeviceId: root
+    hashDeviceId: roothash
+    corruptionOption: panic
+  filesystems:
+  - deviceId: esp
+    type: fat32
+    mountPoint:
+      path: /boot/efi
+      options: ro,umask=0077
+  - deviceId: boot
+    type: ext4
+    mountPoint:
+      path: /boot
+      options: ro
+  - deviceId: verityroot
+    type: ext4
+    mountPoint:
+      path: /
+      options: ro
+
+os:
+  bootloader:
+    resetType: hard-reset
+  uki:
+    mode: create
+  kernelCommandLine:
+    extraCommandLine:
+    - systemd.volatile=overlay
+    - console=ttyS0,115200n8
+    - rd.info
+  packages:
+    remove:
+    - grub2-efi-binary
+    install:
+    - openssh-server
+    - veritysetup
+    - systemd-boot
+    - device-mapper
+  users:
+  - name: repro
+    sshPublicKeyPaths:
+    - operator.pub
+    startupCommand: /bin/bash
+  services:
+    enable:
+    - sshd
+  additionalFiles:
+  - destination: /etc/systemd/system/systemd-boot-random-seed.service.d/91-readonly-esp.conf
+    content: |
+      [Unit]
+      ConditionPathIsReadWrite=/boot/efi
+  - destination: /var/lib/hyperv/.kvp_pool_1
+    permissions: "600"
+    content: ""
+  - destination: /etc/systemd/system/systemd-remount-fs.service.d/91-root-volatile-overlay.conf
+    content: |
+      [Service]
+      ExecStartPost=/usr/bin/findmnt --mountpoint / --types overlay
+      ExecStartPost=/usr/bin/mount -o remount,rw /
+  - destination: /etc/dracut.conf.d/91-root-volatile-overlay.conf
+    content: |
+      add_drivers+=" overlay hv_vmbus hv_storvsc hv_netvsc "
+  - destination: /etc/cloud/cloud.cfg.d/91-no-root-grow.cfg
+    content: |
+      growpart:
+        mode: "off"
+      resize_rootfs: false
+  - destination: /etc/sudoers.d/91-repro
+    permissions: "440"
+    content: |
+      repro ALL=(ALL) NOPASSWD: ALL
+  - destination: /etc/verity-repro-modify
+    content: |
+      protected-base-original
+  - destination: /etc/verity-repro-delete
+    content: |
+      protected-base-delete-test
+  - destination: /var/lib/verity-repro/seed
+    content: |
+      protected-var-original

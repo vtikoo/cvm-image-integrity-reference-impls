@@ -104,7 +104,8 @@ class BashControllerTests(unittest.TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_existing_or_repository_run_directory_rejected(self):
-        for directory in (self.run, ROOT / "not-created-by-test"):
+        for directory in (self.run, ROOT / "not-created-by-test",
+                          ROOT.parents[1] / "not-created-by-test"):
             with self.subTest(directory=directory):
                 result = self.bash(["deploy.sh", *PLAN, "--ssh-public-key", str(self.fixture / "public.pub"),
                                     "--run-directory", str(directory)], check=False)

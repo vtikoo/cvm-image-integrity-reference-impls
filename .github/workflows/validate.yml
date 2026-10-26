@@ -1,4 +1,4 @@
-name: Validate recipe
+name: Validate configurations
 on: [push, pull_request]
 permissions:
   contents: read
@@ -10,14 +10,18 @@ jobs:
       - name: Check shell syntax
         run: find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
       - name: Exercise native Linux controllers without Azure
-        run: python3 tests/test_bash.py
+        run: python3 ubuntu/verity-tmpfs-root/tests/test_bash.py
+      - name: Exercise Azure Linux build wrapper and guest status policy
+        run: |
+          python3 azure-linux/verity-tmpfs-root/tests/test_build.py
+          python3 azure-linux/verity-tmpfs-root/test-cloud-status.py
   scripts:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Validate scripts, configuration, and certificate profile
         shell: pwsh
-        run: .\tests\Test-Local.ps1
+        run: .\ubuntu\verity-tmpfs-root\tests\Test-Local.ps1
   producer:
     runs-on: ubuntu-22.04
     steps:

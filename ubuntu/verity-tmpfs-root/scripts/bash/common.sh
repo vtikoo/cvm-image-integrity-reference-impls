@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+CHECKOUT_ROOT=$(cd -- "$REPO_ROOT/../.." && pwd -P)
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 

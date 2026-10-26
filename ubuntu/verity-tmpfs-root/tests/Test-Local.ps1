@@ -40,6 +40,22 @@ $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=
     [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
 $certificate = $request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-5), [DateTimeOffset]::UtcNow.AddDays(1))
 try {
+    $publicKeyPath = Join-Path $temporary 'operator.pub'
+    [IO.File]::WriteAllText($publicKeyPath, "ssh-ed25519 AAAATEST local-guard-test`n")
+    & {
+        function az { throw 'Unexpected Azure invocation during run-directory guard test.' }
+        $checkout = [IO.Path]::GetFullPath((Join-Path $root '..\..'))
+        foreach ($directory in @($root, $checkout, (Join-Path $checkout 'azure-linux\not-created-by-test'))) {
+            $rejection = $null
+            try {
+                & (Join-Path $root 'Deploy.ps1') @arguments -SshPublicKey $publicKeyPath -RunDirectory $directory
+            }
+            catch { $rejection = $_.Exception.Message }
+            if ($rejection -ne 'RunDirectory must be outside this repository.') {
+                throw "Expected whole-checkout output rejection, got: $rejection"
+            }
+        }
+    }
     $der = $certificate.Export([Security.Cryptography.X509Certificates.X509ContentType]::Cert)
     $certPath = Join-Path $temporary 'public.der'
     $profilePath = Join-Path $temporary 'profile.json'

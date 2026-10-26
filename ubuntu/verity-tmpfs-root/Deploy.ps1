@@ -21,7 +21,7 @@ if (-not $RunDirectory) {
     $RunDirectory = Join-Path ([Environment]::GetFolderPath('UserProfile')) "canonical-cvm-runs\$Prefix"
 }
 $RunDirectory = [IO.Path]::GetFullPath($RunDirectory)
-$repository = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
+$repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')).TrimEnd('\','/') + [IO.Path]::DirectorySeparatorChar
 if ($RunDirectory.StartsWith($repository, [StringComparison]::OrdinalIgnoreCase) -or
     $RunDirectory -eq $repository.TrimEnd('\','/')) { throw 'RunDirectory must be outside this repository.' }
 if (Test-Path -LiteralPath $RunDirectory) { throw 'Use a new run directory; inspect a prior run rather than overwrite it.' }
