@@ -1,7 +1,7 @@
-# CVM Image Integrity
+# CVM Image Integrity Reference Implementations
 
-Deployment recipes, instructions, and validation for Confidential VM image
-integrity. The common theme is enforcing and verifying image integrity, not a
+Reference implementations, deployment recipes, instructions, and validation for
+Confidential VM image integrity. The common theme is enforcing and verifying image integrity, not a
 particular Linux distribution or writable-root configuration.
 
 ## Configurations
