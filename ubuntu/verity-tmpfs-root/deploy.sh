@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Azure-hosted build: creates a temporary builder and a separate reference CVM.
+# Running this controller on Linux does not build locally; see LOCAL-BUILD.md.
 set -euo pipefail
 umask 077
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/scripts/bash/common.sh"
@@ -29,6 +31,7 @@ while (( $# )); do
 done
 require_tools jq python3
 validate_inputs
+# Stop before Azure calls or filesystem changes when only previewing configuration.
 if [[ "$PLAN" == true ]]; then new_config; exit 0; fi
 require_tools az openssl realpath base64 gzip sha256sum tar cmp date
 [[ -f "$SSH_PUBLIC_KEY" ]] || die 'Supply an existing SSH public key file.'
@@ -36,6 +39,7 @@ key=$(< "$SSH_PUBLIC_KEY")
 [[ "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-[^[:space:]]+)[[:space:]][A-Za-z0-9+/]+=*([[:space:]].*)?$ ]] ||
     die 'Supply an OpenSSH public key, not private SSH/signing material.'
 RUN_DIR=$(realpath -m -- "${RUN_DIR:-$HOME/canonical-cvm-runs/$PREFIX}")
+# Keep run-specific evidence out of Git and refuse to overwrite a previous run.
 [[ "$RUN_DIR" != "$CHECKOUT_ROOT" && "$RUN_DIR" != "$CHECKOUT_ROOT/"* ]] || die 'Run directory must be outside this repository.'
 [[ ! -e "$RUN_DIR" && ! -L "$RUN_DIR" ]] || die 'Use a new run directory; do not overwrite an earlier run.'
 mkdir -p -- "$(dirname -- "$RUN_DIR")"
@@ -44,6 +48,8 @@ mkdir -- "$RUN_DIR/evidence"
 new_config > "$RUN_DIR/config.json"
 load_config
 
+# On failure, request deallocation only in our owned group; retain resources and
+# evidence for diagnosis rather than deleting an incomplete run automatically.
 on_exit() {
     local result=$? group vms vm
     trap - EXIT
@@ -78,8 +84,11 @@ owned_group
 azure network nsg create -g "$RESOURCE_GROUP" -n "$(cfg .networkSecurityGroup)" -l "$LOCATION" -o none
 azure network vnet create -g "$RESOURCE_GROUP" -n "$(cfg .network)" -l "$LOCATION" \
     --address-prefixes 10.73.0.0/24 --subnet-name "$(cfg .subnet)" --subnet-prefixes 10.73.0.0/26 -o none
+# Guest commands run on the builder through managed Run Command, not inbound SSH.
 new_vm helper "$(cfg .imageUrn)"
 managed_guest "$REPO_ROOT/scripts/Install-HelperTools.sh" helper-tools HELPER_TOOLS_READY
+# Assemble the remote UKI rebuild. Its signing key is generated on the builder;
+# only the public certificate and verified build metadata are retrieved below.
 {
     printf '#!/bin/bash\nset -euo pipefail\n'
     stage_file "$REPO_ROOT/scripts/custom-uki/Rebuild-SignedUki.sh" /var/tmp/canonical-build/Rebuild-SignedUki.sh
@@ -90,18 +99,23 @@ read_artifact /var/tmp/canonical-build/custom-uki-1/custom-uki-build.json "$RUN_
 read_artifact /var/tmp/canonical-build/custom-uki-1/signer.der "$RUN_DIR/guest-signer.der"
 new_security_profile "$RUN_DIR/guest-signer.der" "$RUN_DIR/guest-security-profile.json"
 managed_guest "$REPO_ROOT/scripts/Build-Producer.sh" producer-build PRODUCER_BUILD_AND_TESTS_PASSED
+# Use an unbooted source disk, attached only after the builder is running.
+# Never reboot the builder with this duplicate-layout disk attached.
 azure_json "$RUN_DIR/evidence/source-disk.json" disk create -g "$RESOURCE_GROUP" -n "$(cfg .sourceDisk)" -l "$LOCATION" \
     --image-reference "$(cfg .imageUrn)" --security-type ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey \
     --sku StandardSSD_LRS --hyper-v-generation V2 --os-type Linux
 jq -n --arg name "$(cfg .sourceDisk)" --slurpfile disk "$RUN_DIR/evidence/source-disk.json" '{
     properties:{storageProfile:{dataDisks:[{lun:0,name:$name,createOption:"Attach",
     managedDisk:{id:$disk[0].id},caching:"ReadOnly",deleteOption:"Detach"}]}}}' > "$RUN_DIR/evidence/source-attach-request.json"
+# Raw PATCH avoids Azure CLI VM-model handling of policy-added extensions.
 azure rest --method patch --url "https://management.azure.com$BASE/providers/Microsoft.Compute/virtualMachines/$HELPER?api-version=2024-07-01" \
     --body "@$RUN_DIR/evidence/source-attach-request.json" --headers Content-Type=application/json -o none
 managed_guest "$REPO_ROOT/scripts/Wait-SourceDisk.sh" source-ready SOURCE_DISK_READY
 jq -e '.signature_verified_with_poc_certificate==true and (.signed_uki_sha256|test("^[0-9a-f]{64}$")) and
     (.build_directory|test("^/var/tmp/canonical-build/custom-uki-[0-9]+$"))' \
     "$RUN_DIR/evidence/verified-custom-uki-build.json" >/dev/null || die 'An actual verified custom UKI build is required.'
+# Generalize a disposable copy before hashing, then install the signed UKI.
+# The guest build must also pass verity corruption and fixed-VHD checks.
 {
     printf '#!/bin/bash\nset -euo pipefail\numask 077\n'
     stage_file "$REPO_ROOT/scripts/custom-uki/Prepare-OfflineSource.sh" /var/tmp/canonical-build/Prepare-OfflineSource.sh
@@ -113,6 +127,7 @@ jq -e '.signature_verified_with_poc_certificate==true and (.signed_uki_sha256|te
     printf 'bash /var/tmp/canonical-build/Build-Image.sh\n'
 } > "$RUN_DIR/evidence/build-protected-image.sh"
 managed_guest "$RUN_DIR/evidence/build-protected-image.sh" image-build IMAGE_BUILD_AND_NEGATIVE_TESTS_PASSED "$HELPER" 3600
+# Scope upload permission to the builder's managed identity; no storage key/SAS.
 publication_scope
 {
     printf '#!/bin/bash\nset -euo pipefail\nexport POC_BLOB_URL=%q\npython3 - <<\x27PYTHON\x27\n' \
@@ -125,8 +140,11 @@ managed_guest "$REPO_ROOT/scripts/Collect-BuildEvidence.sh" collect-build-eviden
 read_artifact /var/tmp/canonical-build/build-evidence.tar.gz "$RUN_DIR/evidence/build-evidence.tar.gz"
 mkdir -- "$RUN_DIR/evidence/build"
 tar -xzf "$RUN_DIR/evidence/build-evidence.tar.gz" -C "$RUN_DIR/evidence/build"
+# Require completed replication and exact UEFI signer/template readback before boot.
 publish_image
 new_vm reference "$VERSION_ID"
+# Check actual firmware trust, verity/tmpfs, workload, and a real volatile reboot.
 verify_reference
+# Delete builder/source/upload resources; retain the Gallery and deallocated target.
 cleanup_run
 printf 'DEPLOYMENT_VERIFIED: image=%s; target=%s; target deallocated; evidence=%s\n' "$VERSION_ID" "$TARGET" "$RUN_DIR"
