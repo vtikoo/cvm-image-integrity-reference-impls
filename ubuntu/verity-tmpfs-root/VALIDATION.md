@@ -52,6 +52,13 @@ exact Gallery signer gates, and distinct reboot IDs. Configuration is compared
 with the PowerShell plan. These are controller tests, not simulated proof of
 firmware or verity correctness.
 
+The [manual local-builder workflow](LOCAL-BUILD.md) uses explicit source-device
+and offline kernel-tree inputs to those same guest build scripts. Tests cover
+rejection of missing/non-block source inputs and missing/non-directory kernel
+roots; the default Azure inputs are unchanged. This is not an end-to-end local
+build, Marketplace export, local upload, or one-target Azure acceptance result.
+Neither deployment controller selects that manual path automatically.
+
 **A new Azure end-to-end run of either packaged entry point is not claimed.**
 Run it in your own dedicated scope and require all acceptance evidence before
 calling your deployment successful. No source-run credentials, certificates,

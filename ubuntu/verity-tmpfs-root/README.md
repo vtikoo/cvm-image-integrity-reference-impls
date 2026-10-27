@@ -39,7 +39,34 @@ The original component scripts passed real Azure first-boot and reboot
 acceptance. This extracted, parameterized entry point has local/CI validation;
 a fresh-account deployment of the packaged entry point is not claimed.
 
-## Prerequisites
+## Choose where to build
+
+| Workflow | Where image preparation runs | Azure VMs created |
+| --- | --- | --- |
+| `deploy.sh` or `Deploy.ps1` | A temporary Azure builder VM that the controller creates for you | Builder + reference CVM; at most two concurrently |
+| [Existing Linux environment](LOCAL-BUILD.md) | Your own Linux build machine, using the shared build scripts manually | One reference CVM for Azure acceptance; no Azure builder |
+
+**Both deployment controllers create the builder VM automatically.** Running
+`deploy.sh` on Linux does not make that Linux machine the builder: it is still
+the controller for an Azure-hosted build. You do not need to prepare a builder
+yourself, and there is no local-build flag on either controller. `--plan` /
+`-Plan` creates no resources.
+
+The builder and reference VM serve different purposes. The builder prepares
+and signs the image offline; the reference CVM boots the published result to
+verify firmware trust, verity/tmpfs, and reboot behavior. The source Marketplace
+image is an **unbooted disk**, not a third VM. On success, the controllers delete
+the builder and temporary upload resources, retain the private Gallery image,
+and leave the reference CVM **deallocated**.
+
+The cloud builder is a convenience, not an integrity requirement. If you already
+have a suitable Linux build environment, use the [manual local-build workflow](LOCAL-BUILD.md)
+instead. It covers obtaining the source, using its matching kernel/module tree
+without changing your host kernel, building/signing locally, publishing with
+your Azure identity, and validating one Azure target. That manual path has not
+been exercised end to end; see its prerequisites and validation limits.
+
+## Prerequisites for the automatic builder workflow
 
 - **Linux:** Bash 4+, Azure CLI, `jq`, Python 3, OpenSSL, GNU core utilities,
   `gzip`, and `tar`. PowerShell is **not** required for deployment or cleanup.
@@ -98,9 +125,11 @@ run directory. By default, configuration/evidence are saved outside the checkout
 at `$HOME\canonical-cvm-runs\<prefix>`. An explicit `-RunDirectory` must also be
 outside the repository.
 
-The run:
+## What both deployment controllers create and run
 
-1. Creates one helper from the pinned Marketplace image, with a system-assigned
+Removing the plan flag from either controller starts this same workflow:
+
+1. Automatically creates one temporary builder/helper from the pinned Marketplace image, with a system-assigned
    identity. Uses managed Run Command, not an inbound SSH allow rule.
 2. Generates a new RSA-3072 signing key **inside the helper**, mode `0600`, and
    retrieves only its public certificate.

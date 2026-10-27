@@ -83,6 +83,28 @@ class BashControllerTests(unittest.TestCase):
         self.assertEqual(self.config["maximumVms"], 2)
         self.assertEqual(self.calls(), [])
 
+    def test_local_source_requires_an_existing_block_device(self):
+        image = self.fixture / "not-a-block-device.raw"
+        image.write_bytes(b"not a disk")
+        for path, message in ((image, "Source must be a block device"),
+                              (self.fixture / "missing.raw", "Source disk does not exist")):
+            with self.subTest(path=path):
+                result = self.bash(["scripts/Build-Image.sh"], check=False,
+                                   env=dict(self.env, POC_SOURCE_DISK=str(path)))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_local_kernel_input_requires_an_existing_directory(self):
+        file = self.fixture / "not-a-directory"
+        file.write_text("not a kernel tree")
+        for path, message in ((file, "Kernel input root must be a directory"),
+                              (self.fixture / "missing-root", "Kernel input root does not exist")):
+            with self.subTest(path=path):
+                result = self.bash(["scripts/custom-uki/Rebuild-SignedUki.sh", "stock", "key", "cert", "out", "kernel"],
+                                   check=False, env=dict(self.env, POC_KERNEL_ROOT=str(path)))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_plan_matches_powershell_configuration(self):
         result = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-File", str(ROOT / "Deploy.ps1"),
                                  "-SubscriptionId", SUBSCRIPTION, "-ResourceGroup", "test-cvm-rg",

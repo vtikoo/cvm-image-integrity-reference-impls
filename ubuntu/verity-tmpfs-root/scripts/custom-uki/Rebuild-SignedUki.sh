@@ -5,6 +5,11 @@ if (($# != 5)); then
     echo 'Usage: Rebuild-SignedUki.sh STOCK_UKI PRIVATE_KEY CERTIFICATE_PEM OUTPUT_DIRECTORY KERNEL_VERSION' >&2
     exit 2
 fi
+kernel_root=$(readlink -e "${POC_KERNEL_ROOT:-/}") || {
+    echo 'Kernel input root does not exist; mount the matching source root read-only.' >&2
+    exit 1
+}
+test -d "$kernel_root" || { echo 'Kernel input root must be a directory.' >&2; exit 1; }
 test "$(id -u)" = 0
 for command in objcopy unmkinitramfs modprobe modinfo depmod cpio gzip sbsign sbverify sbattach openssl python3 chroot; do
     command -v "$command" >/dev/null || { echo "Missing required tool: $command" >&2; exit 1; }
@@ -29,8 +34,8 @@ certificate_public=$(openssl x509 -in "$certificate" -pubkey -noout |
 test "$key_public" = "$certificate_public"
 openssl x509 -in "$certificate" -checkend 0 -noout
 openssl x509 -in "$certificate" -outform DER -out "$out/signer.der"
-grep -qx 'CONFIG_RD_GZIP=y' "/boot/config-$kernel"
-modules=$(readlink -e "/lib/modules/$kernel")
+grep -qx 'CONFIG_RD_GZIP=y' "$kernel_root/boot/config-$kernel"
+modules=$(readlink -e "$kernel_root/lib/modules/$kernel")
 objcopy --dump-section ".initrd=$out/stock.initrd" "$stock" "$out/inspection-copy.efi"
 test "$(sha256sum "$stock" | cut -d ' ' -f1)" = "$stock_hash"
 unmkinitramfs "$out/stock.initrd" "$out/unpacked"
@@ -38,7 +43,7 @@ main="$out/unpacked/main"
 test -d "$main/usr/lib/modules/$kernel"
 test "$(readlink -m "$main/lib/modules/$kernel")" = "$main/usr/lib/modules/$kernel"
 for name in dm_verity overlay; do
-    modprobe -C /dev/null --set-version "$kernel" --show-depends "$name"
+    modprobe -C /dev/null --dirname "$kernel_root" --set-version "$kernel" --show-depends "$name"
 done > "$out/module-plan.txt"
 while read -r kind file rest; do
     if [[ "$kind" == builtin ]]; then continue; fi

@@ -30,6 +30,12 @@ Start in the selected configuration directory. The previous root-level
 `ubuntu/verity-tmpfs-root`; their command-line interfaces are unchanged.
 There is no implicit default distribution or root-level deployment command.
 
+For Ubuntu, `deploy.sh` and `Deploy.ps1` **create a temporary Azure builder VM
+for you**, then deploy a separate reference CVM. Running the Bash controller on
+Linux does not build on that machine. Users with an existing Linux environment
+can instead follow the [manual local-builder workflow](ubuntu/verity-tmpfs-root/LOCAL-BUILD.md),
+which builds locally and uses just one Azure target VM for acceptance.
+
 Keep run directories, image artifacts, credentials and raw guest evidence
 outside this checkout. Each configuration documents its own resource creation,
 retention and cleanup behavior; reading this index creates no Azure resources.

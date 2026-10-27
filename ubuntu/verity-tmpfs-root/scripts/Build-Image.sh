@@ -1,5 +1,10 @@
 #!/bin/bash
 set -euo pipefail
+source=$(readlink -e "${POC_SOURCE_DISK:-/dev/disk/azure/scsi1/lun0}") || {
+    echo 'Source disk does not exist; set POC_SOURCE_DISK for a local build.' >&2
+    exit 1
+}
+test -b "$source" || { echo 'Source must be a block device, not an image file.' >&2; exit 1; }
 work=/var/tmp/canonical-build
 image="$work/root-working.raw"
 out="$work/evidence"
@@ -38,8 +43,6 @@ partition_by_label() {
     local field=$1 label=$2
     lsblk -rpn -o "PATH,$field" "$nbd" | awk -v label="$label" '$2==label { print $1 }'
 }
-source=$(readlink -e /dev/disk/azure/scsi1/lun0)
-test -b "$source"
 if lsblk -srpn -o PATH "$(findmnt -n -o SOURCE /)" | grep -Fxq "$source"; then
     echo 'Refusing to use the helper boot disk.' >&2
     exit 1
