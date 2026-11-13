@@ -1,0 +1,14 @@
+[Unit]
+Description=Require a verified root before switching out of the initramfs
+DefaultDependencies=no
+Requires=sysroot.mount systemd-volatile-root.service
+After=sysroot.mount systemd-volatile-root.service
+Before=initrd-switch-root.target
+OnFailure=emergency.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/cvm-check-root /sysroot
+StandardOutput=journal+console
+StandardError=journal+console
+RemainAfterExit=yes

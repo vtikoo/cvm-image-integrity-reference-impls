@@ -1,0 +1,669 @@
+diff --git a/crates/azure-guest-attestation-sdk/README.md b/crates/azure-guest-attestation-sdk/README.md
+index 82119e2..aacc810 100644
+--- a/crates/azure-guest-attestation-sdk/README.md
++++ b/crates/azure-guest-attestation-sdk/README.md
+@@ -27,6 +27,27 @@ Rust implementation of the Azure Attestation SDK for Confidential VMs (CVM) and
+ 
+ ## Installation
+ 
++### Linux measurement logs
++
++Guest report construction reads the firmware TCG2 log and the systemd
++JSON-sequence log at `/run/log/systemd/tpm2-measure.log`. Genuine phase records
++for selected PCR 11 are appended as EV_IPL entries, with every recorded bank
++digest checked against the measured string. Phase order is retained; there is
++no fixed boot-phase transcript. Unsupported selected userspace event types or
++banks and malformed/unreadable logs fail explicitly.
++
++SHA-256 static PCR replay and the quote's selected-PCR digest must match the
++collected PCR values. One-shot attestation recollects at most three times when
++measurements change or the log has not caught up; decomposed report construction
++returns the consistency error to its caller. A missing userspace log is allowed
++only if firmware-only replay still matches. Dynamic PCR reset states are not
++replayed by this check. These checks do not independently authenticate the AK
++signature or establish challenge-bound quote freshness.
++
++The low-level `guest_attest::collect_tcg_logs` helper now takes the selected PCR
++indices and returns `io::Result<Vec<u8>>`; callers must handle collection errors.
++Windows collection behavior is unchanged.
++
+ Add to your `Cargo.toml`:
+ 
+ ```toml
+diff --git a/crates/azure-guest-attestation-sdk/src/client.rs b/crates/azure-guest-attestation-sdk/src/client.rs
+index 3b9ac0c..d2376af 100644
+--- a/crates/azure-guest-attestation-sdk/src/client.rs
++++ b/crates/azure-guest-attestation-sdk/src/client.rs
+@@ -470,7 +470,20 @@ impl AttestationClient {
+         options: Option<&AttestOptions>,
+     ) -> crate::error::Result<AttestationReport> {
+         let os = OsInfo::detect()?;
+-        let tcg_logs = guest_attest::collect_tcg_logs(&os);
++        let tcg_logs = guest_attest::collect_tcg_logs(&os, &device_evidence.pcrs)?;
++        if os.os_type == "Linux" {
++            let pcr_values: Vec<(u32, Vec<u8>)> = device_evidence
++                .tpm_info
++                .pcrs
++                .iter()
++                .map(|entry| (entry.index, entry.digest.clone()))
++                .collect();
++            azure_tpm::event_log::validate_sha256_quote_and_log(
++                &tcg_logs,
++                &device_evidence.tpm_info.pcr_quote,
++                &pcr_values,
++            )?;
++        }
+         let client_payload = options
+             .and_then(|o| o.client_payload.as_deref())
+             .unwrap_or("");
+@@ -577,12 +590,28 @@ impl AttestationClient {
+             device_type: DeviceType::Tpm,
+             pcr_selection,
+         };
+-        let device_evidence = self.get_device_evidence(Some(&dev_opts))?;
++        let mut attempt = 0;
++        let report = loop {
++            attempt += 1;
++            let device_evidence = self.get_device_evidence(Some(&dev_opts))?;
++            match self.create_attestation_report(
++                &device_evidence,
++                cvm_evidence.as_ref(),
++                None,
++                options,
++            ) {
++                Ok(report) => break report,
++                Err(SdkError::Io(err))
++                    if err.kind() == std::io::ErrorKind::WouldBlock && attempt < 3 =>
++                {
++                    tracing::warn!(target: "guest_attest", attempt, error = %err,
++                        "Measurements changed; recollecting TPM and log evidence");
++                    std::thread::sleep(std::time::Duration::from_millis(50));
++                }
++                Err(err) => return Err(err),
++            }
++        };
+         timer.mark("device_evidence");
+-
+-        // 4. Build the attestation report (request JSON)
+-        let report =
+-            self.create_attestation_report(&device_evidence, cvm_evidence.as_ref(), None, options)?;
+         timer.mark("build_report");
+ 
+         // 5. Base64url encode and submit to provider
+diff --git a/crates/azure-guest-attestation-sdk/src/guest_attest/mod.rs b/crates/azure-guest-attestation-sdk/src/guest_attest/mod.rs
+index bcf77df..e3b3ecc 100644
+--- a/crates/azure-guest-attestation-sdk/src/guest_attest/mod.rs
++++ b/crates/azure-guest-attestation-sdk/src/guest_attest/mod.rs
+@@ -20,6 +20,7 @@
+ 
+ pub mod imds;
+ pub mod provider;
++mod tcg;
+ 
+ // Re-export commonly used items at this module level for convenience.
+ pub use imds::ImdsClient;
+@@ -550,24 +551,23 @@ pub fn base64_url_decode(s: &str) -> io::Result<Vec<u8>> {
+ // TCG log collection
+ // ---------------------------------------------------------------------------
+ 
+-/// Collect TCG event logs (best-effort, platform-specific).
+-pub fn collect_tcg_logs(os: &OsInfo) -> Vec<u8> {
++/// Collect TCG logs, including genuine selected systemd phase measurements.
++///
++/// Linux read/format failures are returned instead of submitting an empty log.
++pub fn collect_tcg_logs(os: &OsInfo, selected_pcrs: &[u32]) -> io::Result<Vec<u8>> {
+     match os.os_type.as_str() {
+-        "Linux" => {
+-            const LINUX_TCG_LOG_PATH: &str = "/sys/kernel/security/tpm0/binary_bios_measurements";
+-            std::fs::read(LINUX_TCG_LOG_PATH).unwrap_or_default()
+-        }
++        "Linux" => tcg::collect_linux_logs(selected_pcrs),
+         "Windows" => {
+             #[cfg(target_os = "windows")]
+             {
+-                read_windows_wbcl()
++                Ok(read_windows_wbcl())
+             }
+             #[cfg(not(target_os = "windows"))]
+             {
+-                Vec::new()
++                Ok(Vec::new())
+             }
+         }
+-        _ => Vec::new(),
++        _ => Ok(Vec::new()),
+     }
+ }
+ 
+@@ -1154,7 +1154,7 @@ mod tests {
+             build: "".into(),
+             pcr_list: vec![],
+         };
+-        let logs = collect_tcg_logs(&os);
++        let logs = collect_tcg_logs(&os, &[]).unwrap();
+         assert!(logs.is_empty());
+     }
+ 
+@@ -1520,7 +1520,7 @@ mod tests {
+     // -----------------------------------------------------------------------
+ 
+     #[test]
+-    fn collect_tcg_logs_linux_returns_bytes_or_empty() {
++    fn collect_tcg_logs_linux_returns_bytes_or_explicit_error() {
+         let os = OsInfo {
+             os_type: "Linux".into(),
+             distro: "Test".into(),
+@@ -1529,9 +1529,9 @@ mod tests {
+             build: "".into(),
+             pcr_list: vec![],
+         };
+-        // On a test machine without TPM this returns empty; on a real CVM it returns data.
+-        // Either way it should not panic.
+-        let _logs = collect_tcg_logs(&os);
++        if let Ok(logs) = collect_tcg_logs(&os, &[0, 7, 11]) {
++            assert!(!logs.is_empty());
++        }
+     }
+ 
+     #[test]
+@@ -1546,7 +1546,7 @@ mod tests {
+             pcr_list: vec![],
+         };
+         // Running on Linux, the Windows path should return empty
+-        assert!(collect_tcg_logs(&os).is_empty());
++        assert!(collect_tcg_logs(&os, &[]).unwrap().is_empty());
+     }
+ 
+     // -----------------------------------------------------------------------
+diff --git a/crates/azure-guest-attestation-sdk/src/guest_attest/tcg.rs b/crates/azure-guest-attestation-sdk/src/guest_attest/tcg.rs
+new file mode 100644
+index 0000000..bda6db4
+--- /dev/null
++++ b/crates/azure-guest-attestation-sdk/src/guest_attest/tcg.rs
+@@ -0,0 +1,61 @@
++// Copyright (c) Microsoft Corporation.
++// Licensed under the MIT License.
++
++use std::fs::File;
++use std::io::{self, Read};
++use std::path::Path;
++
++const FIRMWARE_LOG: &str = "/sys/kernel/security/tpm0/binary_bios_measurements";
++const SYSTEMD_LOG: &str = "/run/log/systemd/tpm2-measure.log";
++const MAX_LOG_BYTES: u64 = 64 * 1024 * 1024;
++
++fn read_log(path: &Path) -> io::Result<Vec<u8>> {
++    let mut bytes = Vec::new();
++    File::open(path)
++        .and_then(|file| file.take(MAX_LOG_BYTES + 1).read_to_end(&mut bytes))
++        .map_err(|err| io::Error::new(err.kind(), format!("{}: {err}", path.display())))?;
++    if bytes.len() as u64 > MAX_LOG_BYTES {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            format!("{} exceeds event-log size limit", path.display()),
++        ));
++    }
++    Ok(bytes)
++}
++
++pub(super) fn collect_linux_logs(selected_pcrs: &[u32]) -> io::Result<Vec<u8>> {
++    let firmware = read_log(Path::new(FIRMWARE_LOG))?;
++    let userspace = match read_log(Path::new(SYSTEMD_LOG)) {
++        Ok(bytes) => bytes,
++        Err(err) if err.kind() == io::ErrorKind::NotFound => {
++            tracing::info!(target: "guest_attest", path = SYSTEMD_LOG,
++                "No systemd userspace log; firmware replay must still match quoted PCRs");
++            Vec::new()
++        }
++        Err(err) => return Err(err),
++    };
++    let combined =
++        azure_tpm::event_log::supplement_systemd_events(&firmware, &userspace, selected_pcrs)?;
++    tracing::info!(target: "guest_attest", firmware_bytes = firmware.len(),
++        userspace_bytes = userspace.len(), combined_bytes = combined.len(),
++        "Collected firmware plus genuine systemd measurement evidence");
++    Ok(combined)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn missing_firmware_path_is_an_explicit_error() {
++        let path = std::env::temp_dir().join(format!("missing-tcg-log-{}", std::process::id()));
++        let error = read_log(&path).unwrap_err();
++        assert_eq!(error.kind(), io::ErrorKind::NotFound);
++        assert!(error.to_string().contains("missing-tcg-log"));
++    }
++
++    #[test]
++    fn unreadable_path_is_not_an_empty_log() {
++        assert!(read_log(&std::env::temp_dir()).is_err());
++    }
++}
+diff --git a/crates/azure-tpm/src/event_log.rs b/crates/azure-tpm/src/event_log.rs
+index 521f838..6d3d9b4 100644
+--- a/crates/azure-tpm/src/event_log.rs
++++ b/crates/azure-tpm/src/event_log.rs
+@@ -547,6 +547,9 @@ pub fn replay_pcrs(events: &[Event], alg: PcrAlgorithm) -> BTreeMap<u32, Vec<u8>
+     let mut state: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+ 
+     for event in events {
++        if event.event_type == SPEC_ID_EVENT_TYPE {
++            continue;
++        }
+         if let Some(measurement) = event.digest_for_algorithm(alg) {
+             if measurement.len() != digest_len {
+                 continue;
+@@ -562,6 +565,198 @@ pub fn replay_pcrs(events: &[Event], alg: PcrAlgorithm) -> BTreeMap<u32, Vec<u8>
+     state
+ }
+ 
++/// Append genuine systemd phase records as TCG2 EV_IPL entries.
++///
++/// Firmware bytes are preserved. Only selected PCRs are supplemented; unsupported
++/// selected userspace measurements fail instead of being silently discarded.
++pub fn supplement_systemd_events(
++    firmware: &[u8],
++    userspace: &[u8],
++    selected_pcrs: &[u32],
++) -> io::Result<Vec<u8>> {
++    let firmware_log = parse_event_log_with_event1_spec(firmware)?;
++    let spec = firmware_log
++        .events
++        .first()
++        .and_then(|event| try_parse_spec_id_event(&event.event_data))
++        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Missing TCG2 Spec ID event"))?;
++    if spec.spec_version_major < 2 {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "Systemd supplementation requires TCG2",
++        ));
++    }
++    let mut combined = firmware.to_vec();
++    if userspace.iter().all(u8::is_ascii_whitespace) {
++        return Ok(combined);
++    }
++    if userspace.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&0x1e) {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "Expected systemd JSON sequence",
++        ));
++    }
++    for (index, record) in userspace.split(|byte| *byte == 0x1e).enumerate() {
++        if record.iter().all(u8::is_ascii_whitespace) {
++            continue;
++        }
++        let parsed: JsonTextEvent = serde_json::from_slice(record).map_err(|err| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!("Systemd record {index}: {err}"),
++            )
++        })?;
++        if parsed.pcr > 23 {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "Invalid systemd PCR index",
++            ));
++        }
++        if !selected_pcrs.contains(&parsed.pcr) {
++            continue;
++        }
++        let content = parsed.content.as_ref().ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::InvalidData,
++                "Missing systemd measurement content",
++            )
++        })?;
++        if parsed.content_type.as_deref() != Some("systemd")
++            || parsed.pcr != 11
++            || content.get("eventType").and_then(serde_json::Value::as_str) != Some("phase")
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                format!(
++                    "Unsupported selected systemd measurement at PCR {}",
++                    parsed.pcr
++                ),
++            ));
++        }
++        let phase = content
++            .get("string")
++            .and_then(serde_json::Value::as_str)
++            .ok_or_else(|| {
++                io::Error::new(io::ErrorKind::InvalidData, "Missing measured phase string")
++            })?;
++        if phase.len() > MAX_EVENT_DATA_SIZE
++            || parsed.digests.is_empty()
++            || parsed.digests.len() > MAX_DIGEST_COUNT as usize
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "Invalid systemd event size",
++            ));
++        }
++        let mut digests = BTreeMap::new();
++        for entry in parsed.digests {
++            let alg = PcrAlgorithm::from_str(&entry.hash_alg).map_err(|err| {
++                io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!("Unsupported recorded bank: {err}"),
++                )
++            })?;
++            let digest = hex::decode(&entry.digest).map_err(|err| {
++                io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    format!("Invalid recorded digest: {err}"),
++                )
++            })?;
++            let expected = match alg {
++                PcrAlgorithm::Sha1 => crate::crypto::sha1_concat(&[phase.as_bytes()]),
++                PcrAlgorithm::Sha256 => crate::crypto::sha256_concat(&[phase.as_bytes()]),
++                PcrAlgorithm::Sha384 => crate::crypto::sha384_concat(&[phase.as_bytes()]),
++            };
++            if digest != expected
++                || !spec.algorithms.iter().any(|bank| {
++                    bank.algorithm_id == alg.to_alg_id()
++                        && usize::from(bank.digest_size) == digest.len()
++                })
++                || digests.insert(alg.to_alg_id(), digest).is_some()
++            {
++                return Err(io::Error::new(
++                    io::ErrorKind::InvalidData,
++                    "Systemd digest mismatch, undeclared or duplicate bank",
++                ));
++            }
++        }
++        combined.extend_from_slice(&parsed.pcr.to_le_bytes());
++        combined.extend_from_slice(&0x0000_000Du32.to_le_bytes());
++        combined.extend_from_slice(&(digests.len() as u32).to_le_bytes());
++        for (algorithm, digest) in digests {
++            combined.extend_from_slice(&algorithm.to_le_bytes());
++            combined.extend_from_slice(&digest);
++        }
++        combined.extend_from_slice(&(phase.len() as u32).to_le_bytes());
++        combined.extend_from_slice(phase.as_bytes());
++    }
++    Ok(combined)
++}
++
++/// Check static SHA-256 PCR replay and the quote's selected-PCR digest.
++///
++/// A changing PCR/log snapshot returns WouldBlock so one-shot callers can
++/// recollect evidence with a bounded retry. This does not verify the AK signature.
++pub fn validate_sha256_quote_and_log(
++    log: &[u8],
++    quote: &[u8],
++    pcr_values: &[(u32, Vec<u8>)],
++) -> io::Result<()> {
++    let events = parse_event_log_with_event1_spec(log)?;
++    let replay = replay_pcrs(&events.events, PcrAlgorithm::Sha256);
++    if quote.get(..4) != Some(&[0xff, 0x54, 0x43, 0x47]) {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "Invalid TPM quote magic",
++        ));
++    }
++    let parsed = crate::types::parse_quote_attestation(quote)?;
++    if parsed.pcr_selections.len() != 1
++        || parsed.pcr_selections[0].hash_alg != PcrAlgorithm::Sha256.to_alg_id()
++    {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "Expected one SHA-256 quote bank",
++        ));
++    }
++    let selection = &parsed.pcr_selections[0];
++    let quoted: Vec<u32> = (0..24)
++        .filter(|index| selection.select[(index / 8) as usize] & (1 << (index % 8)) != 0)
++        .collect();
++    let values: BTreeMap<u32, &[u8]> = pcr_values
++        .iter()
++        .map(|(index, digest)| (*index, digest.as_slice()))
++        .collect();
++    if values.len() != pcr_values.len()
++        || quoted != values.keys().copied().collect::<Vec<_>>()
++        || values.values().any(|value| value.len() != 32)
++    {
++        return Err(io::Error::new(
++            io::ErrorKind::InvalidData,
++            "PCR values do not match quote selection",
++        ));
++    }
++    let zero = [0u8; 32];
++    let mut aggregate = Vec::new();
++    for index in quoted {
++        // Dynamic PCR reset state is not reconstructible from the firmware log.
++        if index < 16 && replay.get(&index).map(Vec::as_slice).unwrap_or(&zero) != values[&index] {
++            return Err(io::Error::new(
++                io::ErrorKind::WouldBlock,
++                format!("SHA-256 PCR {index} does not match event-log replay; recollect evidence"),
++            ));
++        }
++        aggregate.extend_from_slice(values[&index]);
++    }
++    if parsed.pcr_digest != crate::crypto::sha256_concat(&[&aggregate]) {
++        return Err(io::Error::new(
++            io::ErrorKind::WouldBlock,
++            "PCR values changed while quoting; recollect evidence",
++        ));
++    }
++    Ok(())
++}
++
+ pub fn event_type_description(event_type: u32) -> Option<&'static str> {
+     match event_type {
+         0x00000000 => Some("EV_PREBOOT_CERT"),
+@@ -647,8 +842,8 @@ fn parse_spec_id_event(data: &[u8]) -> io::Result<SpecIdEvent> {
+             "spec id version truncated",
+         ));
+     }
+-    let spec_version_major = data[cursor];
+-    let spec_version_minor = data[cursor + 1];
++    let spec_version_minor = data[cursor];
++    let spec_version_major = data[cursor + 1];
+     let spec_errata = data[cursor + 2];
+     let uintn_size = data[cursor + 3];
+     cursor += 4;
+@@ -996,6 +1191,8 @@ struct JsonTextEvent {
+     event_type: Option<String>,
+     #[serde(default)]
+     content: Option<serde_json::Value>,
++    #[serde(default)]
++    content_type: Option<String>,
+ }
+ 
+ #[derive(Deserialize)]
+@@ -1010,6 +1207,179 @@ mod tests {
+     use super::*;
+     use crate::types::PcrAlgorithm;
+ 
++    fn tcg2_fixture() -> Vec<u8> {
++        let mut spec = b"Spec ID Event03\0".to_vec();
++        spec.extend_from_slice(&0u32.to_le_bytes());
++        spec.extend_from_slice(&[0, 2, 0, 2]);
++        spec.extend_from_slice(&3u32.to_le_bytes());
++        for alg in [
++            PcrAlgorithm::Sha1,
++            PcrAlgorithm::Sha256,
++            PcrAlgorithm::Sha384,
++        ] {
++            spec.extend_from_slice(&alg.to_alg_id().to_le_bytes());
++            spec.extend_from_slice(&(alg.digest_len() as u16).to_le_bytes());
++        }
++        spec.push(0);
++        let mut log = Vec::new();
++        log.extend_from_slice(&0u32.to_le_bytes());
++        log.extend_from_slice(&SPEC_ID_EVENT_TYPE.to_le_bytes());
++        log.extend_from_slice(&[0; 20]);
++        log.extend_from_slice(&(spec.len() as u32).to_le_bytes());
++        log.extend_from_slice(&spec);
++        log
++    }
++
++    fn phase_record(phase: &str) -> serde_json::Value {
++        serde_json::json!({
++            "pcr": 11, "content_type": "systemd",
++            "digests": [
++                {"hashAlg": "sha1", "digest": hex::encode(crate::crypto::sha1_concat(&[phase.as_bytes()]))},
++                {"hashAlg": "sha256", "digest": hex::encode(crate::crypto::sha256_concat(&[phase.as_bytes()]))},
++                {"hashAlg": "sha384", "digest": hex::encode(crate::crypto::sha384_concat(&[phase.as_bytes()]))}
++            ],
++            "content": {"string": phase, "eventType": "phase", "bootId": "fixture"}
++        })
++    }
++
++    fn json_sequence(records: &[serde_json::Value]) -> Vec<u8> {
++        let mut log = Vec::new();
++        for record in records {
++            log.push(0x1e);
++            log.extend_from_slice(serde_json::to_string_pretty(record).unwrap().as_bytes());
++            log.push(b'\n');
++        }
++        log
++    }
++
++    fn quote_fixture(pcr_values: &[(u32, Vec<u8>)]) -> Vec<u8> {
++        let mut quote = 0xff54_4347u32.to_be_bytes().to_vec();
++        quote.extend_from_slice(&0x8018u16.to_be_bytes());
++        quote.extend_from_slice(&0u16.to_be_bytes());
++        quote.extend_from_slice(&0u16.to_be_bytes());
++        quote.extend_from_slice(&[0; 25]);
++        quote.extend_from_slice(&1u32.to_be_bytes());
++        quote.extend_from_slice(&PcrAlgorithm::Sha256.to_alg_id().to_be_bytes());
++        quote.push(3);
++        let mut bitmap = [0u8; 3];
++        let mut aggregate = Vec::new();
++        for (index, value) in pcr_values {
++            bitmap[(index / 8) as usize] |= 1 << (index % 8);
++            aggregate.extend_from_slice(value);
++        }
++        quote.extend_from_slice(&bitmap);
++        quote.extend_from_slice(&32u16.to_be_bytes());
++        quote.extend_from_slice(&crate::crypto::sha256_concat(&[&aggregate]));
++        quote
++    }
++
++    #[test]
++    fn systemd_supplement_preserves_firmware_and_arbitrary_phase_order() {
++        let firmware = tcg2_fixture();
++        let phases = [
++            "enter-initrd",
++            "leave-initrd",
++            "sysinit",
++            "ready",
++            "custom-phase",
++        ];
++        let records: Vec<_> = phases.iter().map(|phase| phase_record(phase)).collect();
++        let merged = supplement_systemd_events(&firmware, &json_sequence(&records), &[11]).unwrap();
++        assert!(merged.starts_with(&firmware));
++        let parsed = parse_event_log(&merged).unwrap();
++        assert_eq!(parsed.events.len(), phases.len() + 1);
++        for (event, phase) in parsed.events[1..].iter().zip(phases) {
++            assert_eq!(event.pcr_index, 11);
++            assert_eq!(event.event_type, 0xD);
++            assert_eq!(event.event_data, phase.as_bytes());
++            assert_eq!(event.digests.len(), 3);
++        }
++    }
++
++    #[test]
++    fn systemd_supplement_rejects_malformed_or_invented_measurements() {
++        let firmware = tcg2_fixture();
++        assert!(supplement_systemd_events(&firmware, b"\x1e{\"pcr\":", &[11]).is_err());
++        assert!(supplement_systemd_events(&firmware, b"{}", &[11]).is_err());
++        let original = phase_record("ready");
++        let mut variants = Vec::new();
++        let mut changed = original.clone();
++        changed["content"]["string"] = "not-recorded".into();
++        variants.push(changed);
++        let mut changed = original.clone();
++        changed["digests"][0]["digest"] = "00".into();
++        variants.push(changed);
++        let mut changed = original.clone();
++        changed["digests"][0]["hashAlg"] = "unknown".into();
++        variants.push(changed);
++        let mut changed = original.clone();
++        let duplicate = changed["digests"][0].clone();
++        changed["digests"].as_array_mut().unwrap().push(duplicate);
++        variants.push(changed);
++        let mut changed = original;
++        changed["content"]["eventType"] = "unknown".into();
++        variants.push(changed);
++        for record in variants {
++            assert!(
++                supplement_systemd_events(&firmware, &json_sequence(&[record]), &[11]).is_err()
++            );
++        }
++        assert!(supplement_systemd_events(b"", &[], &[11]).is_err());
++    }
++
++    #[test]
++    fn systemd_supplement_only_handles_selected_pcrs() {
++        let firmware = tcg2_fixture();
++        let mut other = phase_record("machine");
++        other["pcr"] = 15.into();
++        other["content"]["eventType"] = "machine-id".into();
++        let log = json_sequence(&[other]);
++        assert_eq!(
++            supplement_systemd_events(&firmware, &log, &[11]).unwrap(),
++            firmware
++        );
++        assert!(supplement_systemd_events(&firmware, &log, &[15]).is_err());
++    }
++
++    #[test]
++    fn quote_and_log_consistency_includes_zero_and_measured_pcrs() {
++        let firmware = tcg2_fixture();
++        let merged = supplement_systemd_events(
++            &firmware,
++            &json_sequence(&[phase_record("sysinit"), phase_record("ready")]),
++            &[11],
++        )
++        .unwrap();
++        let replay = replay_pcrs(
++            &parse_event_log(&merged).unwrap().events,
++            PcrAlgorithm::Sha256,
++        );
++        let values = vec![
++            (0, vec![0; 32]),
++            (11, replay[&11].clone()),
++            (12, vec![0; 32]),
++        ];
++        let quote = quote_fixture(&values);
++        validate_sha256_quote_and_log(&merged, &quote, &values).unwrap();
++        let error = validate_sha256_quote_and_log(&firmware, &quote, &values).unwrap_err();
++        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
++        let mut wrong_quote = quote;
++        *wrong_quote.last_mut().unwrap() ^= 1;
++        assert_eq!(
++            validate_sha256_quote_and_log(&merged, &wrong_quote, &values)
++                .unwrap_err()
++                .kind(),
++            io::ErrorKind::WouldBlock
++        );
++        assert!(validate_sha256_quote_and_log(&merged, &wrong_quote, &values[..2]).is_err());
++    }
++
++    #[test]
++    fn replay_does_not_extend_no_action_records() {
++        let events = parse_event_log(&tcg2_fixture()).unwrap();
++        assert!(replay_pcrs(&events.events, PcrAlgorithm::Sha1).is_empty());
++    }
++
+     // -----------------------------------------------------------------------
+     // event_type_description tests
+     // -----------------------------------------------------------------------
+@@ -1081,9 +1451,9 @@ mod tests {
+         data.extend_from_slice(sig);
+         // Platform class (u32 LE)
+         data.extend_from_slice(&0u32.to_le_bytes());
+-        // Version major, minor, errata, uintn_size
+-        data.push(2); // major
++        // Version minor, major, errata, uintn_size
+         data.push(0); // minor
++        data.push(2); // major
+         data.push(0); // errata
+         data.push(2); // uintn_size
+                       // Algorithm count = 1

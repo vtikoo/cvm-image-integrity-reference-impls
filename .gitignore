@@ -10,3 +10,4 @@ evidence/
 config.json
 guest-signer.der
 guest-security-profile.json
+__pycache__/

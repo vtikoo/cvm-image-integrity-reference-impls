@@ -1,0 +1,21 @@
+{
+  "imageUrn": "Canonical:ubuntu-24_04-lts:cvm:24.04.202610280",
+  "catalogLocation": "westus3",
+  "catalogChecked": "2026-11-12",
+  "architecture": "x64",
+  "hyperVGeneration": "V2",
+  "ubuntuVersion": "24.04",
+  "espMiB": 512,
+  "dataMiB": 32768,
+  "blockSize": 4096,
+  "attestationSdk": {
+    "repository": "https://github.com/Azure/azure-guest-attestation-sdk.git",
+    "revision": "8774be30f452060c56372d34ccbe34c3d3f3c577",
+    "package": "azure-guest-attest",
+    "pcrs": [0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12],
+    "patch": {
+      "file": "patches/sdk-systemd-event-log.patch",
+      "sha256": "8831ddc355fd5f03e77e5d12eabcdb204239ad11b325518335753f89d455e3bc"
+    }
+  }
+}

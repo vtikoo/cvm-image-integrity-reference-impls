@@ -22,6 +22,46 @@ jobs:
       - name: Validate scripts, configuration, and certificate profile
         shell: pwsh
         run: .\ubuntu\verity-tmpfs-root\tests\Test-Local.ps1
+      - name: Validate shared Dracut PowerShell deployment entry points
+        shell: pwsh
+        run: |
+          if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+            $gitOpenSsl = @('C:\Program Files\Git\usr\bin', 'C:\Program Files\Git\ucrt64\bin',
+              'C:\Program Files\Git\mingw64\bin') |
+              Where-Object { Test-Path (Join-Path $_ 'openssl.exe') } | Select-Object -First 1
+            if (-not $gitOpenSsl) { throw 'OpenSSL is required for Dracut controller tests.' }
+            $env:PATH = "$gitOpenSsl;$env:PATH"
+          }
+          python .\ubuntu\dracut-verity-tmpfs-root\tests\test_deployment.py
+          if ($LASTEXITCODE -ne 0) { throw 'Windows shared-controller tests failed.' }
+          .\ubuntu\dracut-verity-tmpfs-root\tests\Test-Entrypoints.ps1
+  ubuntu-dracut:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install userspace component test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
+      - name: Test offline policy, fail-closed root guard and PCR-11 attestation wrapper
+        run: |
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_attestation.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_guest_validation.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_deployment.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_entrypoints.py
+      - name: Test real Dracut, dm-verity userspace and signed UKI packaging
+        run: sudo python3 ubuntu/dracut-verity-tmpfs-root/tests/test_components.py
+  ubuntu-attestation-sdk:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Test and build the pinned SDK with native systemd log collection patch
+        run: |
+          bash ubuntu/dracut-verity-tmpfs-root/scripts/build-attestation.sh \
+            "$RUNNER_TEMP/ubuntu-attestation-sdk"
   producer:
     runs-on: ubuntu-22.04
     steps:
