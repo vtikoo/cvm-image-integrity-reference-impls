@@ -11,7 +11,7 @@ import subprocess
 import sys
 from urllib.parse import urlsplit
 
-PCRS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12)
+PCRS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13)
 SDK = "/usr/local/bin/azure-guest-attest"
 SDK_BUILD = Path("/etc/cvm-verity/attestation-sdk.json")
 
@@ -50,7 +50,7 @@ def validate_response(response, endpoint):
     require(decode(evidence["Proof"]) and decode(evidence["RunTimeData"]), "Missing TEE proof or runtime data")
     tpm = request["TpmInfo"]
     require(tpm["PcrSet"] == list(PCRS) and all(type(index) is int for index in tpm["PcrSet"]),
-            "Submitted PCR set must include exactly 0-8,11,12")
+            "Submitted PCR set must include exactly 0-8,11,12,13")
     entries = tpm["PCRs"]
     require([entry["Index"] for entry in entries] == list(PCRS)
             and all(type(entry["Index"]) is int for entry in entries),
@@ -69,7 +69,7 @@ def validate_response(response, endpoint):
     require(isinstance(covered, list) and all(type(index) is int for index in covered)
             and len(covered) == len(set(covered)) and set(covered).issubset(PCRS),
             "Invalid token-reported PCR coverage")
-    require(set(PCRS) - {12} <= set(covered), "Token omits required PCR 0-8 or 11 coverage")
+    require(set(PCRS) - {12, 13} <= set(covered), "Token omits required PCR 0-8 or 11 coverage")
     reported_values = claims.get("x-ms-azurevm-attested-pcr-values")
     require(isinstance(reported_values, dict)
             and set(reported_values) == {f"pcr{index}" for index in covered},

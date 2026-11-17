@@ -13,7 +13,7 @@ volatile; the verified ext4 lower never has a writable fallback.
 boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
 using `VMGuestStateOnly`. The patched native SDK collector, tested directly in
 tmpfs without log bind mounts, also obtained a signature-verified custom-policy
-MAA token for PCRs 0-8 and 11. PCR12 remains a token-coverage gap. Stateless boot
+MAA token for PCRs 0-8 and 11. PCR12/13 remain token-coverage gaps. Stateless boot
 and expected-image remote verification remain unqualified. Gallery 1.0.4,
 rebuilt with the native collector, passed publication, first/reboot SSH
 acceptance and installed-collector custom-policy MAA testing on 2026-11-13.
@@ -264,6 +264,139 @@ QUALIFY
 The smaller userspace verification/corruption tests in
 [tests/test_components.py](tests/test_components.py) also remain explicitly invoked.
 
+### Optional offline PCR prediction
+
+See the [predictor design and open trust inputs](PCR-PREDICTOR-DESIGN.md),
+including the unresolved acquisition and approval of the base Secure Boot `db`.
+The baseline preparation below packages approved bytes; it does not obtain or
+authenticate them.
+
+[predict-pcrs.py](scripts/predict-pcrs.py) runs after the successful build, on
+Linux/WSL with Python 3, OpenSSL and `sbverify` from the existing `sbsigntool`
+build prerequisite. It does not boot a VM, contact Azure/MAA, change firmware
+or modify the UKI. Default builds do not generate expected PCRs automatically.
+
+The deliberately narrow `azure-direct-uki-v1` profile predicts SHA256:
+
+- **PCR4:** the `Calling EFI Application from Boot Option` action, four-zero-byte
+  separator, then the final UKI's PE Authenticode digest. This excludes the PE
+  checksum, certificate-directory entry and certificate table, but includes
+  raw-section padding and noncertificate overlay. There is no shim, GRUB,
+  separate measured EFI kernel launch or other application in this profile.
+- **PCR7:** full `SecureBoot`, `PK`, `KEK`, `db` and `dbx` variable measurements,
+  separator, then exactly one direct `db` authority. The tool appends one X509
+  signature list containing the supplied owner GUID and exact signer DER to
+  the approved **default** db. The authority is that owner's GUID plus the same
+  certificate, not a public-key hash. Any different variable bytes, owner,
+  signature-list layout, authority chain or event order require requalification.
+- **PCR11:** systemd-stub **255**'s ordered section-name-with-NUL and section-data
+  measurements, followed by the explicitly selected phase path. Section data
+  uses `VirtualSize`, not raw padding. `.pcrsig` is excluded; `.pcrpkey`, when
+  present, is included. The tool returns UKI-only and successive phase
+  checkpoints rather than silently treating UKI-only PCR11 as boot-complete.
+- **PCR12/PCR13:** initial all-zero SHA256 values under the
+  `no-external-inputs` policy, with no external addons, credentials,
+  system-extension images or other producers extending these PCRs. These are
+  expected policy values, not proof that the stub disables companion inputs.
+
+Only signed x64 PE32+ EFI UKIs with the supported stub marker, contiguous raw
+sections and one end-of-file PKCS7 signature are accepted. Unsupported or
+malformed layouts, wrong signer, baseline-pin mismatch and invalid phases fail
+without emitting prediction JSON. Signature verification checks the supplied
+certificate; baseline approval and actual firmware authority selection remain
+the relying party's responsibility.
+
+#### Prepare and approve the firmware baseline
+
+Obtain complete default variable **values** from an independently trusted
+reference matching your Azure firmware/template revision. Do not use the target
+CVM's event log to establish its own expected policy. No production-approved
+Microsoft baseline is shipped here. Baseline provenance and the SHA256 pin must
+be reviewed and authenticated separately from target evidence.
+
+Prepare `SecureBoot.bin`, `PK.bin`, `KEK.bin`, `db.bin` and `dbx.bin` in a
+protected input directory. These contain only the raw EFI variable values:
+**exclude** the four-byte efivarfs attributes, GUID/name/length event wrappers
+and UTF16 variable name. `SecureBoot.bin` must contain the single byte `01`.
+The other files contain complete EFI signature-list streams; this version
+accepts headerless X509 and SHA256 lists only. The default db must **not**
+already include the custom signer. Do not just remove an arbitrary certificate
+from an untrusted target log and call the remainder approved.
+
+Create a profile outside the checkout after validating those inputs. Replace
+the owner GUID and provenance with the approved enrollment details. The owner
+GUID is measured data and must match how the signer is actually appended.
+The output directory must already exist; an existing profile is not overwritten.
+
+```bash
+umask 077
+python3 - /secure/firmware/default-vars /secure/policy/azure-uki-baseline.json \
+  '<approved-signature-owner-guid>' <<'PY'
+import base64, json, pathlib, sys, uuid
+source, output = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+profile = {
+    "schemaVersion": 1,
+    "bootProfile": "azure-direct-uki-v1",
+    "signatureOwnerGuid": str(uuid.UUID(sys.argv[3])),
+    "provenance": "<approved firmware/template revision and review record>",
+    "variables": {
+        name: base64.b64encode((source / (name + ".bin")).read_bytes()).decode("ascii")
+        for name in ("SecureBoot", "PK", "KEK", "db", "dbx")
+    },
+}
+with output.open("x") as stream:
+    json.dump(profile, stream, indent=2)
+    stream.write("\n")
+PY
+sha256sum /secure/policy/azure-uki-baseline.json
+```
+
+Record that digest in the independently controlled policy/configuration.
+Recomputing a pin from newly supplied, untrusted target data is not approval.
+Secure Boot database/template updates can legitimately change PCR7 even when
+the UKI does not change; review and version new baselines, never silently
+accept drift.
+
+#### Calculate from the final build artifacts
+
+Use the independently retained `cvm.efi` and `signer.der`, not guest-reported
+copies unless verified against independently retained build hashes:
+
+```bash
+python3 scripts/predict-pcrs.py \
+  --uki /secure/runs/dracut-example/cvm.efi \
+  --signer-der /secure/runs/dracut-example/signer.der \
+  --firmware-baseline /secure/policy/azure-uki-baseline.json \
+  --firmware-baseline-sha256 '<previously-approved-profile-sha256>' \
+  --phase-path 'sysinit:ready' \
+  > /secure/runs/dracut-example/evidence/expected-pcrs.json
+```
+
+The retained reference measured `sysinit`, then `ready`; it did **not** measure
+`enter-initrd`/`leave-initrd`. This is an explicit qualification observation,
+not a universal systemd default. If your approved initramfs/services measure
+those phases, use `--phase-path 'enter-initrd:leave-initrd:sysinit:ready'`
+instead and qualify that build. `--phase-path ''` requests the UKI-only
+checkpoint, not a claim about a fully booted guest. No phase services are
+masked or otherwise changed by this tool.
+
+JSON `pcrs` has exactly the string keys `"4"`, `"7"`, `"11"`, `"12"` and `"13"`
+with lowercase 64-digit digests. `externalInputPolicy` is `no-external-inputs`;
+PCR12/13 are each 64 zeroes and their event lists are empty.
+`pcr11Checkpoints` records each cumulative `phasePath`;
+`events` records ordered digest/extension steps, and `inputs` binds the UKI,
+signer and baseline file hashes. Protect and approve this output as expected
+policy independently of the evaluated guest.
+
+Matching these predictions to authenticated MAA claims adds expected-image
+comparison for this model; this helper does not implement that verifier,
+independent AK/quote/TEE validation, fresh challenge binding or rollback
+protection. The PCR12/13 zero references require qualification of the deployed
+empty-input sequence; nonempty external-input sequences are not modeled.
+Tested MAA tokens still omit PCR12/13, even when both were requested. Emitting
+expected values neither supplies authenticated coverage nor disables addons,
+credentials or system extensions.
+
 ## 3. Publish and enroll the actual signer
 
 Use a new private Azure Compute Gallery and your owned upload resources. See the
@@ -435,7 +568,7 @@ SSH connection; do not treat partial output as acceptance. File hashes establish
 transfer consistency, not remote attestation authenticity.
 
 The wrapper always invokes the pinned SDK's **guest** attestation flow with
-`--provider maa --pcr-index 0,1,2,3,4,5,6,7,8,11,12 --user-data hex:<nonce> --json --show-request`.
+`--provider maa --pcr-index 0,1,2,3,4,5,6,7,8,11,12,13 --user-data hex:<nonce> --json --show-request`.
 PCR 4 covers firmware image measurements, PCR 7 covers Secure Boot policy,
 and **PCR 11 covers systemd-stub's UKI section measurements**, including the
 embedded `.cmdline` with `roothash=` and the data/hash partition identifiers.
@@ -488,9 +621,9 @@ Evidence is private and volatile under the new `/run` directory:
   provenance; it explicitly says `NOT_VERIFIED`;
 - `tokenClaimsUnverified` in the receipt reports token coverage and raw PCR
   values, without authenticating the JWT. Coverage and values must match the
-  request for PCRs 0-8 and 11. Missing PCR12 emits
-  `ATTESTATION_TOKEN_PCR_COVERAGE_GAP=[12]` and leaves coverage incomplete;
-  it is not silently removed from the request.
+  request for PCRs 0-8 and 11. Missing PCR12/13 emits
+  `ATTESTATION_TOKEN_PCR_COVERAGE_GAP=[12, 13]` when both are absent and leaves
+  coverage incomplete; neither is silently removed from the request.
 
 Retrieve the evidence outside the guest before reboot. Protect tokens and raw
 VM-identifying evidence; do not commit them. Failed collection retains
@@ -527,11 +660,11 @@ that MAA can attest PCR-11 coverage; the index list is not a digest.
 That example is for Windows. Our actual Linux/TDX token additionally contains
 `x-ms-azurevm-attested-pcr-values`, mapping names such as `pcr7` and `pcr11` to
 base64 SHA-256 values. Its signature was verified and its reported values
-matched the submitted evidence. The diagnostic requested `0-8,11,12`, but
-the token covers only `0-8,11`: **PCR 12 is a known MAA token-coverage gap**,
-not a reason to remove it from the required expanded request. Its coverage and
-raw value are absent from the tested token, so PCR 12 must not be claimed as
-attested. See [the explicit gap and limits](VALIDATION.md#known-gap-maa-does-not-return-pcr-12-in-the-tested-token).
+matched the submitted evidence. The latest diagnostic requested and quoted
+`0-8,11,12,13`, but the token covers only `0-8,11`: **PCR12 and PCR13 are known
+MAA token-coverage gaps**, not a reason to remove them from the request.
+Their coverage and raw values are absent from the tested token, so neither
+can be claimed as attested. See [the explicit gaps and limits](VALIDATION.md#pcr13-inclusive-tmpfs-diagnostic-2026-11-16).
 Do not assume arbitrary custom claim emission or a particular provider policy.
 
 An independent relying party must:
@@ -673,10 +806,11 @@ This relaxation allows a token despite failed default db validation; it does
 needs independently authenticated expected signer/UKI measurements and the
 quote/TEE/freshness checks above. Keep genuine systemd userspace events in the
 attestation evidence; changing policy does not repair a PCR/event-log mismatch.
-The tested expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12`.
+The latest expanded diagnostic requests PCRs `0,1,2,3,4,5,6,7,8,11,12,13`.
 Neither this policy nor a tmpfs SDK diagnostic changes Gallery 1.0.3's installed
-firmware-only collector. Current recipe builds install the patched SDK and
-expanded-PCR wrapper before generating verity data, as tested in Gallery 1.0.4.
+firmware-only collector. Gallery 1.0.4 tested installation of the patched SDK
+and wrapper before generating verity data, with a `0-8,11,12` request. New builds
+also select PCR13; existing images are not updated by this source change.
 
 ## Threat model and limits
 
@@ -698,6 +832,7 @@ mandatory before claiming a working CVM reference.
 ```bash
 python3 tests/test_recipe.py
 python3 tests/test_attestation.py
+python3 tests/test_pcr_prediction.py
 python3 tests/test_guest_validation.py
 # On a disposable Ubuntu 24.04 test machine:
 sudo apt-get install -y --no-install-recommends \
@@ -709,8 +844,10 @@ The component test creates a real **kernel-less** Dracut/systemd initramfs,
 packages a synthetic kernel payload in a real signed UKI, checks all sections
 and rejects a changed expected command line. It also formats/verifies actual
 verity files and rejects corruption. It does not boot a synthetic or real CVM.
-Missing tools are test failures, not skipped checks. CI runs this configuration
+Missing component-test tools are failures, not skipped checks. CI runs this configuration
 separately on Ubuntu 24.04 without Azure resource creation.
+The predictor tests also compare PCR11 with systemd-measure when available
+(present in the Ubuntu CI job); that oracle alone is skipped when unavailable.
 The attestation wrapper tests use an SDK response double to check exact
 PCR/challenge arguments, token-coverage gap reporting, paired SDK overrides,
 retained evidence and failure handling. A separate CI job applies the pinned

@@ -34,7 +34,7 @@ PURPOSE = "dracut-verity-tmpfs"
 BUILDER_IMAGE = "Canonical:ubuntu-24_04-lts:server:24.04.202610250"
 API = "2024-07-01"
 GALLERY_API = "2024-03-03"
-PCRS = list(range(9)) + [11, 12]
+PCRS = list(range(9)) + [11, 12, 13]
 ARTIFACT_READER = CHECKOUT / "ubuntu/verity-tmpfs-root/scripts/Read-ArtifactChunk.py"
 
 
@@ -175,7 +175,7 @@ def configuration(args):
             "Managed validation needs no inbound route; user must confirm/configure network access for later SSH"
             if args.validation_transport == "managed" else
             "SSH validation requires an approved route to the new private subnet"),
-        "attestationVerification": "NOT_VERIFIED: collection only; PCR12 token coverage may be absent",
+        "attestationVerification": "NOT_VERIFIED: collection only; PCR12/13 token coverage may be absent",
     }
     return config
 
@@ -306,12 +306,12 @@ def validate_receipt(receipt, nonce, build):
     coverage = receipt.get("tokenClaimsUnverified", {})
     reported = coverage.get("reportedPcrs", [])
     require(all(type(item) is int for item in reported) and len(set(reported)) == len(reported)
-            and set(PCRS) - {12} <= set(reported) <= set(PCRS),
+            and set(PCRS) - {12, 13} <= set(reported) <= set(PCRS),
             "Token-reported PCR0-8/11 coverage is required (claims remain unverified)")
     missing = sorted(set(PCRS) - set(reported))
     require(coverage.get("missingRequestedPcrs") == missing
             and coverage.get("requestedCoverageComplete") is (not missing),
-            "Token PCR12 omission must be recorded explicitly")
+            "Token PCR12/13 omissions must be recorded explicitly")
     values = coverage.get("reportedPcrValuesSha256", {})
     require(set(values) == {str(index) for index in reported}
             and all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) for value in values.values()),
@@ -985,7 +985,7 @@ class Engine:
             "limitations": ["MAA JWT signature/issuer/audience not cryptographically verified",
                             "AK certificate/TPM quote not independently verified",
                             "Event log not independently replayed against expected UKI/PCR11",
-                            "Token PCR12 coverage may be absent; no claim of PCR12 attestation"],
+                            "Token PCR12/13 coverage may be absent; no claim of PCR12/13 attestation"],
         })
 
     def acceptance_managed(self, build):
@@ -1024,7 +1024,7 @@ class Engine:
             "attestationCollection": "DEFERRED_TO_SSH",
             "attestationVerification": "NOT_RUN: invoke the installed collector over authenticated SSH after start",
             "limitations": ["Managed basic acceptance does not test SSH connectivity or obtain an MAA token",
-                            "Expected-image remote verification and PCR12 token coverage remain unqualified"],
+                            "Expected-image remote verification and PCR12/13 token coverage remain unqualified"],
         })
 
     def validate_attestation_files(self, local, nonce, build):

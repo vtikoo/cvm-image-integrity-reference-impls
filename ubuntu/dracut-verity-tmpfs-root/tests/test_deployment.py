@@ -81,10 +81,10 @@ class Fixture(unittest.TestCase):
             "nonceHex": "aa" * 32, "requestedPcrs": deploy.PCRS, "reportedPcr11Sha256": "0c" * 32,
             "sdkBuild": {k: v for k, v in self.build["attestationSdk"].items() if k != "wrapperSha256"},
             "sdkPathUntrusted": "/usr/local/bin/azure-guest-attest",
-            "tokenClaimsUnverified": {"reportedPcrs": deploy.PCRS[:-1], "missingRequestedPcrs": [12],
+            "tokenClaimsUnverified": {"reportedPcrs": deploy.PCRS[:-2], "missingRequestedPcrs": [12, 13],
                                       "requestedCoverageComplete": False,
                                       "reportedPcrValuesSha256": {
-                                          str(index): bytes([index + 1]).hex() * 32 for index in deploy.PCRS[:-1]}},
+                                          str(index): bytes([index + 1]).hex() * 32 for index in deploy.PCRS[:-2]}},
         }
 
     def attestation_files(self, nonce):
@@ -97,9 +97,9 @@ class Fixture(unittest.TestCase):
             "TcgLogs": b64(b"unverified event log"), "IsolationInfo": {"Type": "Tdx", "Evidence": {
                 "Proof": b64(b"unverified TDX proof"), "RunTimeData": b64(b"unit runtime")}},
         }
-        claims = {"x-ms-azurevm-attested-pcrs": deploy.PCRS[:-1],
+        claims = {"x-ms-azurevm-attested-pcrs": deploy.PCRS[:-2],
                   "x-ms-azurevm-attested-pcr-values": {
-                      f"pcr{index}": b64(bytes([index + 1]) * 32) for index in deploy.PCRS[:-1]}}
+                      f"pcr{index}": b64(bytes([index + 1]) * 32) for index in deploy.PCRS[:-2]}}
         token = b64(b'{"alg":"RS256"}') + "." + b64(json.dumps(claims).encode()) + "." + b64(b"not-a-real-signature")
         response = {"provider": "maa", "endpoint": self.config["maaEndpoint"], "passed": True,
                     "token": token, "request": json.dumps(request)}
@@ -769,7 +769,7 @@ class EvidenceTests(Fixture):
         self.assertEqual(bootstrap.call_args_list[1].kwargs["previous"], self.boot1)
         summary = deploy.read_json(self.engine.evidence / "acceptance-complete.json")
         self.assertEqual(summary["result"], "ACCEPTANCE_COMPLETE")
-        self.assertEqual(summary["tokenMissingRequestedPcrs"], [12])
+        self.assertEqual(summary["tokenMissingRequestedPcrs"], [12, 13])
         self.assertTrue(summary["attestationVerification"].startswith("NOT_VERIFIED"))
         for name in files:
             path = self.engine.evidence / "attestation" / name
@@ -812,12 +812,12 @@ class EvidenceTests(Fixture):
         with self.assertRaises(deploy.DeploymentError):
             deploy.validate_acceptance(dict(self.acceptance(True), bootId=self.boot1), self.build, self.boot1)
 
-    def test_receipt_is_not_a_verification_and_pcr12_omission_must_be_explicit(self):
-        self.assertEqual(deploy.validate_receipt(self.receipt(), "aa" * 32, self.build), [12])
+    def test_receipt_is_not_a_verification_and_pcr12_13_omissions_must_be_explicit(self):
+        self.assertEqual(deploy.validate_receipt(self.receipt(), "aa" * 32, self.build), [12, 13])
         for change in (
             {"result": "VERIFIED"}, {"verification": "VERIFIED"}, {"nonceHex": "bb" * 32},
             {"sdkPathUntrusted": "/custom/test-sdk"}, {"requestedPcrs": deploy.PCRS[:-1]},
-            {"tokenClaimsUnverified": {"reportedPcrs": deploy.PCRS[:-1], "missingRequestedPcrs": [],
+            {"tokenClaimsUnverified": {"reportedPcrs": deploy.PCRS[:-2], "missingRequestedPcrs": [],
                                       "requestedCoverageComplete": True}},
         ):
             with self.subTest(change=change), self.assertRaises(deploy.DeploymentError):

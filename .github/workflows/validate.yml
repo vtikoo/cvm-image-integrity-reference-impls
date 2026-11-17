@@ -48,6 +48,7 @@ jobs:
         run: |
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_attestation.py
+          python3 ubuntu/dracut-verity-tmpfs-root/tests/test_pcr_prediction.py
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_guest_validation.py
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_deployment.py
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_entrypoints.py

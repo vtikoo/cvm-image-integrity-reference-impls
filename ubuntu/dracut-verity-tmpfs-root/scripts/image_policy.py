@@ -95,8 +95,11 @@ def finalize(root, image_urn):
 
 
 def pe_section(path, section):
+    return pe_section_data(Path(path).read_bytes(), section)
+
+
+def pe_section_data(data, section):
     import struct
-    data = Path(path).read_bytes()
     if data[:2] != b"MZ":
         raise ValueError("Not a PE image")
     pe = struct.unpack_from("<I", data, 0x3C)[0]

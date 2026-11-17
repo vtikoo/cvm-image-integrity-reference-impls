@@ -102,6 +102,8 @@ but this must not be presented as an uninterrupted one-command deployment pass.
 | --- | --- |
 | Marketplace catalog | Read-only Azure queries on 2026-11-12 returned the pinned non-Pro Ubuntu 24.04 CVM version in westus3, x64/Gen2 and `TrustedLaunchAndConfidentialVmSupported` |
 | Offline policy tests | 15 tests passed: generalized-source guards, writable-state finalization, pinned input, exact generated boot inputs, private mount-propagation enforcement, temporary resolver permissions/exact restoration, required switch-root dependency, volatile-service override, shared-parent setup and root-policy success/rejection paths |
+| Offline PCR predictor tests | 7 tests passed, including an independent systemd-measure oracle: PCR7 serialized-variable vector/input sensitivity, Authenticode vector/exclusions/padding/overlay, `.pcrsig` exclusion versus `.pcrpkey` measurement, explicit phase checkpoints, malformed/ambiguous PE and baseline rejection, and no JSON output on signature/dependency failure |
+| PCR4/7/11 artifact-based prediction | Final signed managed-reference UKI was retrieved read-only over authenticated SSH and matched independently retained build SHA256 `d22a84ed33893a7a4d5c5410a765d2057f8f1a529e8f05f5b43d022ea713a341`. Predictions from that artifact, retained signer and a **different reference image's** baseline matched all 3/7/14 ordered PCR4/7/11 event digests and the MAA-signed PCR values. `sbverify` checked the signer; a wrong signer was rejected. Independent `osslsigncode` Authenticode and systemd-measure UKI/sysinit/ready checkpoints also matched. MAA RS256 signature/issuer/lifetime were verified at collection. This is a qualified model, **not approval of a Microsoft factory baseline or a complete remote-attestation verifier** |
 | Guest-verifier tests | 6 tests passed: completed clean cloud-init, explicit recoverable-warning reporting, fatal/incomplete/malformed-status rejection, installed collector/wrapper/provenance checks, query-only dm-verity mount acceptance and wrong mapper/hash/device/mount-policy rejection |
 | Real userspace tests | SHA-256 verity format/verification and corrupted-data/wrong-hash rejection; kernel-less Dracut/systemd initramfs and RSA-signed systemd-stub UKI, exact section checks and changed-command-line rejection |
 | Pinned patched attestation SDK | Exact recipe patch application and default RustCrypto release build passed: 34 event-log and 70 guest-attestation tests. Native backend passed those 104 plus 24 client regressions. Genuine retained firmware/userspace logs produced byte-identical supplementation and matched the actual CVM quote. Wrapper/build's 10 tests require `0-8,11,12`, report the PCR12 gap, check paired SDK overrides and pre-hash installation, and reject incomplete evidence/fallback without claiming remote verification |
@@ -122,6 +124,20 @@ These tests are not simulated evidence of Azure firmware behavior. A UKI with
 a synthetic kernel payload proves packaging/signature/section binding only.
 The Dracut userspace test excludes kernel modules explicitly; the real build
 requires matching signed source modules and an original kernel payload.
+
+The predictor qualification used the managed reference's existing boot,
+systemd-stub 255 and explicit `sysinit:ready` phase path. Its firmware baseline
+was reconstructed from the separate retained manual reference, removing only
+that reference's exact appended signer list before adding the managed image's
+independently retained signer. Earlier PCR7 prototype cross-prediction also
+matched in both directions. Neither exercise establishes an independently
+published/approved factory baseline. No image rebuild, firmware/policy/network
+change, full disk scan or reboot was performed for predictor qualification.
+The existing PCR12 gap and addon capability are unchanged. See
+[profile assumptions and baseline preparation](LOCAL-BUILD.md#optional-offline-pcr-prediction).
+The [predictor design](PCR-PREDICTOR-DESIGN.md) details the measurement model,
+the unresolved base-database acquisition/approval process and remaining
+production gates; these observations do not close those gaps.
 
 The build's success marker is emitted only after root finalization, matching
 driver inspection, initramfs inventory checks, ext4 checks, verity generation,
@@ -279,11 +295,35 @@ but is **absent from the signed coverage/value claims**. Do not claim complete
 coverage of the requested set or infer that a zero PCR alone explains omission:
 the token includes PCR 8 with a zero value.
 
-Keep PCR 12 in the required expanded request `0-8,11,12`; do not remove it to
+Keep PCR 12 in the request (new builds request `0-8,11,12,13`); do not remove it to
 hide the gap. Until the provider returns both its signed coverage and value,
 a relying party cannot verify PCR 12 from this token alone. The cause remains
 unestablished; this observed gap is not a claim that every MAA configuration
 omits PCR 12.
+
+### PCR13-inclusive tmpfs diagnostic, 2026-11-16
+
+The existing managed-reference CVM's installed native SDK was invoked directly
+with `--pcr-index 0,1,2,3,4,5,6,7,8,11,12,13` and a fresh relying-party
+user-data challenge. Evidence was staged in a private tmpfs directory under
+`/run` and retrieved over authenticated SSH with matching SHA-256 hashes.
+The installed collector and wrapper hashes matched the independent build
+record before and after collection. No image rebuild, collector replacement,
+VM restart, network change or MAA policy change was made.
+
+The actual SHA-256 TPM quote selects exactly `0-8,11,12,13`; its aggregate digest
+matches the submitted values. PCR13 was all zero. The existing custom-policy
+provider issued a token whose RS256 signature, issuer, lifetime and reported PCR
+values were independently verified. Both signed coverage and signed values
+still contain only **`0-8,11`**: **PCR12 and PCR13 are absent**. Token issuance
+therefore does not provide relying-party PCR13 verification for this test.
+This does not establish behavior for nonzero PCR13 or every MAA configuration.
+At test time, the installed wrapper still requested `0-8,11,12`. The recipe now
+selects `0-8,11,12,13` in its image-installed wrapper, SDK build metadata and
+controller receipt checks, explicitly recording either or both missing PCR12/13
+claims. This source update has not been rebuilt into or deployed as a new image.
+The diagnostic does not add independent AK/quote-signature/TEE authentication or
+fresh quote-challenge binding.
 
 ### Verified evidence and remaining limits
 
