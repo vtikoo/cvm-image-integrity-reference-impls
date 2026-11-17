@@ -43,7 +43,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
+            dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool squashfs-tools
       - name: Test offline policy, fail-closed root guard and PCR-11 attestation wrapper
         run: |
           python3 ubuntu/dracut-verity-tmpfs-root/tests/test_recipe.py

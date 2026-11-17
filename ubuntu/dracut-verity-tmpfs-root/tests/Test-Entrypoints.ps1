@@ -16,6 +16,10 @@ $parameters = @{
     NetworkAddressPrefix = '10.80.0.0/24'
     SubnetPrefix = '10.80.0.0/26'
     Plan = $true
+    RootFilesystem = 'squashfs'
+    VmSize = 'Standard_DC4eds_v6'
+    DisableSecureBoot = $true
+    EphemeralOsDisk = $true
 }
 $config = (& (Join-Path $recipe 'Deploy.ps1') @parameters) | ConvertFrom-Json
 if ($config.resourceGroup -ne $parameters.ResourceGroup -or $config.prefix -ne $parameters.Prefix) {
@@ -23,6 +27,13 @@ if ($config.resourceGroup -ne $parameters.ResourceGroup -or $config.prefix -ne $
 }
 if ($config.sourceImage -ne 'Canonical:ubuntu-24_04-lts:cvm:24.04.202610280') {
     throw 'PowerShell deployment did not select the Dracut image pin.'
+}
+if ($config.rootFilesystem -ne 'squashfs') {
+    throw 'PowerShell deployment did not forward the lower filesystem selection.'
+}
+if ($config.vmSize -ne $parameters.VmSize -or
+    $config.secureBootEnabled -ne $false -or -not $config.ephemeralOsDisk) {
+    throw 'PowerShell deployment did not forward ephemeral TDX test choices.'
 }
 if ($config.sshSourceCidr -ne $parameters.SshSourceCidr -or
     $config.networkAddressPrefix -ne $parameters.NetworkAddressPrefix -or
@@ -41,6 +52,11 @@ $managed.ValidationTransport = 'managed'
 $managedConfig = (& (Join-Path $recipe 'Deploy.ps1') @managed) | ConvertFrom-Json
 if ($managedConfig.validationTransport -ne 'managed') {
     throw 'PowerShell deployment did not forward managed acceptance.'
+}
+$managed.Remove('DisableSecureBoot')
+$defaultConfig = (& (Join-Path $recipe 'Deploy.ps1') @managed) | ConvertFrom-Json
+if ($defaultConfig.secureBootEnabled -ne $true) {
+    throw 'PowerShell deployment did not preserve Secure Boot by default.'
 }
 if (Test-Path -LiteralPath $run) { throw 'Plan wrote a run directory.' }
 $parameters.Prefix = 'invalid prefix'

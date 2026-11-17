@@ -7,7 +7,8 @@ initramfs/manifest flow with **Dracut and systemd**. It starts from an unbooted
 Azure Ubuntu CVM Marketplace disk, finalizes a disposable root filesystem,
 generates dm-verity data, and builds a signed UKI embedding `roothash=` and
 explicit data/hash partition identifiers. All writes to the effective root are
-volatile; the verified ext4 lower never has a writable fallback.
+volatile; the verified lower (ext4 by default, optionally SquashFS) never has a
+writable fallback. Both modes retain the whole-root tmpfs overlay.
 
 **Status: experimental. Complete Marketplace conversion, custom-signed UKI
 boot and first-boot/real-reboot acceptance passed on an Azure Intel TDX CVM
@@ -19,6 +20,8 @@ rebuilt with the native collector, passed publication, first/reboot SSH
 acceptance and installed-collector custom-policy MAA testing on 2026-11-13.
 Older Gallery 1.0.3 still contains the firmware-only collector.**
 See [the observed evidence and limits](VALIDATION.md).
+These Azure results used ext4. SquashFS is a new optional mode, not yet
+qualified by an Azure first-boot/reboot run.
 Do not claim production integrity or remote image verification from these tests.
 
 ## Inputs and boundaries
@@ -60,20 +63,21 @@ Azure are manual, optional, billable operations in your own authorized scope.
 Unbooted Marketplace raw disk (read-only)
   -> new GPT disk; copy root and optional separate /boot
   -> offline customization + guest packages + matching-kernel Dracut initramfs
-  -> unmount root, check ext4, veritysetup format
+  -> finalize ext4 or pack gzip SquashFS; unmount staging root
+  -> check lower filesystem, veritysetup format over the full data partition
   -> ukify with original kernel, new initramfs, generated signed .cmdline
   -> write signed UKI to ESP only, check GPT and fixed-VHD format
   -> fixed Azure VHD
 
 Firmware Secure Boot db -> signed EFI/BOOT/BOOTX64.EFI (systemd-stub UKI)
   -> systemd-veritysetup-generator -> read-only /dev/mapper/root
-  -> /sysroot ext4 ro,noload -> systemd.volatile=overlay (tmpfs upper/work)
+  -> /sysroot read-only ext4 or SquashFS -> whole-root overlay (tmpfs upper/work)
   -> required initramfs root-policy guard -> switch-root -> writable volatile /
 ```
 
-The new disk has a 512 MiB ESP, 32 GiB ext4 data partition, and a separately
+The new disk has a 512 MiB ESP, 32 GiB data partition, and a separately
 sized SHA-256 verity hash partition. Data/hash PARTUUIDs are generated per build.
-The signed command line contains:
+The default ext4 signed command line contains:
 
 ```text
 root=/dev/mapper/root rootfstype=ext4 ro rootflags=ro,noload
@@ -84,9 +88,13 @@ systemd.verity_root_options=panic-on-corruption
 systemd.volatile=overlay
 ```
 
+SquashFS instead embeds `rootfstype=squashfs rootflags=ro`; it does not use ext4's
+`noload` option. All verity bindings, corruption handling and whole-root overlay
+settings are unchanged.
+
 Root-device auto-discovery and initrd fstab processing are disabled. A required
 unit blocks `initrd-switch-root.service` unless the effective root is a writable
-overlay with upper/work on the same tmpfs, an ext4 read-only lower is mounted
+overlay with upper/work on the same tmpfs, a supported read-only lower is mounted
 from the healthy verity mapper, and no swap is active. Corruption must not be
 ignored. A second guard checks the effective root during normal system startup.
 The Dracut module overrides `systemd-volatile-root.service` with a fail-closed
@@ -96,6 +104,8 @@ retains a tmpfs at `/run/cvm-overlay`, and mounts the overlay using visible
 upper/work directories there. This avoids native systemd's covered root mount
 and detached tmpfs backing, so both initramfs and runtime guards can verify the
 actual backing filesystems rather than trusting setup metadata.
+Guest acceptance additionally checks that the live lower type matches the
+independently retained build's `rootFilesystem` (ext4 or SquashFS).
 There is no GRUB, shim, unsigned command-line add-on, Canonical manifest or
 stock-initramfs fallback on the new ESP. Firmware must support the standard
 Gen2 removable-media path; it was accepted in the tested persisted-TPM configuration.
@@ -166,6 +176,8 @@ sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
   build-essential git python3 binutils openssl sbsigntool systemd-ukify qemu-utils \
   rsync gdisk dosfstools e2fsprogs cryptsetup-bin util-linux udev kmod
+# Also required when choosing the optional SquashFS lower:
+sudo apt-get install -y --no-install-recommends squashfs-tools
 ```
 
 The builder also needs an approved Rust toolchain (SDK minimum Rust 1.90;
@@ -198,6 +210,14 @@ reproducibility and arbitrary future package versions are not claimed.
 
 Budget at least 150 GiB plus package headroom. The 32 GiB data partition is
 fixed for this configuration; a source that does not fit fails during copy.
+SquashFS mode first finalizes the root in a separate sparse 32 GiB ext4 staging
+file, then packs it with gzip after all pseudo-filesystems have been unmounted.
+Allow additional space for the uncompressed staging files and compressed image.
+Packing preserves ownership, permissions, hardlinks and extended attributes.
+The build requires `CONFIG_SQUASHFS_ZLIB=y` and the matching signed/built-in
+source SquashFS driver and dependencies; missing support aborts the build.
+The compressed image must fit the data partition. Its trailing zero padding is
+also hashed; neither the fixed partition nor fixed VHD gets smaller.
 Optional corruption qualification makes a disposable data-partition copy. Reserve ample
 tmpfs RAM in the eventual CVM; do not add disk swap to compensate.
 
@@ -217,6 +237,14 @@ sudo unshare --mount --propagation private bash build-image.sh /secure/input/sou
   /secure/runs/dracut-example '<exact-source-kernel-version>'
 ```
 
+To select SquashFS, append the sixth positional argument:
+
+```bash
+sudo unshare --mount --propagation private bash build-image.sh /secure/input/source.raw \
+  /secure/signer/db.key /secure/signer/db.pem \
+  /secure/runs/dracut-squashfs '<exact-source-kernel-version>' squashfs
+```
+
 The key stays outside the guest and output image. Existing run directories,
 in-checkout signing inputs/output directories, provisioned sources and
 mismatched/expired certificates are rejected. The source image is opened
@@ -226,9 +254,10 @@ Success requires `DRACUT_VERITY_IMAGE_BUILD_PASSED` and produces:
 
 - `image.raw`, Azure fixed `image.vhd`, `cvm.efi` and public `signer.der`;
 - original kernel payload, new initramfs and exact generated `cmdline`;
-- `evidence/build.json` with kernel, root hash and both PARTUUIDs;
+- `evidence/build.json` with kernel, root hash, both PARTUUIDs and `rootFilesystem`;
 - source/output hashes, source/output GPT layout, package and signed-driver
-  inventories, initrd inventory, verity format, ext4 and fixed-VHD checks.
+  inventories, initrd inventory, verity format, filesystem and fixed-VHD checks
+  (`fsck.txt` for ext4; `squashfs.txt` for SquashFS).
 
 The signed UKI's `.linux`, `.initrd` and `.cmdline` are checked byte-for-byte
 against inputs; `sbverify` checks the certificate signature. The protected root
@@ -267,7 +296,8 @@ The smaller userspace verification/corruption tests in
 ### Optional offline PCR prediction
 
 See the [predictor design and open trust inputs](PCR-PREDICTOR-DESIGN.md),
-including the unresolved acquisition and approval of the base Secure Boot `db`.
+including the unresolved acquisition and approval of the base Secure Boot `db`
+for the enabled profile. The disabled profile omits PCR7 and needs no base `db`.
 The baseline preparation below packages approved bytes; it does not obtain or
 authenticate them.
 
@@ -306,7 +336,36 @@ without emitting prediction JSON. Signature verification checks the supplied
 certificate; baseline approval and actual firmware authority selection remain
 the relying party's responsibility.
 
+For a policy that does not rely on firmware signature enforcement, select the
+separate `azure-direct-uki-no-secureboot-v1` profile:
+
+```bash
+python3 scripts/predict-pcrs.py \
+  --disable-secure-boot \
+  --uki /secure/runs/dracut-example/cvm.efi \
+  --signer-der /secure/runs/dracut-example/signer.der \
+  --phase-path 'sysinit:ready' \
+  > /secure/runs/dracut-example/evidence/expected-pcrs.json
+```
+
+This mode rejects firmware-baseline arguments and omits PCR7 from `pcrs` and
+`events`, with `pcr7Policy: not-evaluated`. PCR4/11 and zero-PCR12/13 calculations
+are unchanged. The signed artifact and signer are still checked, but firmware
+enrollment is not required by this image policy. Selecting this mode neither
+disables Secure Boot on a VM nor attests its state.
+
+With Secure Boot off, the stock systemd-stub 255 can replace the embedded
+command line with EFI invocation arguments measured into PCR12. Consequently,
+matching PCR4/11 does not by itself establish the effective verity parameters.
+Require authenticated zero PCR12/13 for the qualified no-external-inputs policy,
+or approve an implementation that disables/constrains those inputs independently
+of Secure Boot. The tested MAA tokens do not authenticate PCR12/13. The disabled
+profile's live measurement sequence and remote verification remain unqualified;
+withhold secrets until fresh hardware-bound evidence is verified.
+
 #### Prepare and approve the firmware baseline
+
+This subsection applies only to the default Secure-Boot-enabled profile.
 
 Obtain complete default variable **values** from an independently trusted
 reference matching your Azure firmware/template revision. Do not use the target
@@ -419,26 +478,25 @@ Required publication and deployment gates:
 4. Deploy one supported **ConfidentialVM** (the acceptance target is
    `Standard_DC4es_v6`, Intel TDX), with Secure Boot and vTPM
    enabled and `VMGuestStateOnly`, following the original custom-key enrollment
-   approach. Do not use Trusted Launch or disable Secure
-   Boot to make a failed UKI boot. Pass your own SSH public key.
+   approach. For an explicitly chosen measured-boot-only deployment, the
+   automatic controller accepts `--disable-secure-boot` / `-DisableSecureBoot`;
+   a manual deployment must likewise explicitly request Secure Boot off and
+   keep vTPM enabled. Do not use Trusted Launch or silently retry without
+   Secure Boot after a failure. Pass your own SSH public key.
 5. Retain Azure `az vm show` evidence of the actual Gallery version and
    `securityProfile`. Confirm capacity/quota before allocating.
 
 Removing the Canonical initramfs also removes its disk-unlock/provisioning
 integration. This reference uses an unencrypted verified OS disk and
 `VMGuestStateOnly` for persisted encrypted firmware/TPM guest state, not
-confidential OS-disk encryption. `NonPersistedTPM` is a separate experimental
-non-persisted guest-state mode; neither option here selects an ephemeral OS
-disk. This reference does **not** support
+confidential OS-disk encryption. OS-disk placement is independent: the automatic
+controller's `--ephemeral-os-disk` selects local NVMe storage on an eligible
+TDX SKU. This reference does **not** support
 `DiskWithVMGuestState`, Canonical's FDE key-unlock flow, or claim compatibility
 with every CVM family. Preserve appropriate image licensing and export policy.
-Stateless custom-key boot is currently blocked: both initial and corrected-image
-`NonPersistedTPM` attempts reported Azure Compute Secure Boot errors despite
-matching Gallery signer readback. An explicit stateless Gallery image profile
-also encountered incompatible definition/UEFI API requirements in the tested
-configuration. See [observed validation limits](VALIDATION.md); do not disable
-Secure Boot or claim that Gallery readback proves the guest firmware trusts the
-key.
+See [observed validation limits](VALIDATION.md); Gallery readback alone does not
+prove that guest firmware trusts the key, and Secure-Boot-disabled boot success
+does not qualify remote image approval.
 
 ## 4. Accept the deployed CVM, including a real reboot
 
@@ -505,6 +563,12 @@ wrapper and provenance to match independent build evidence on both boots.
 Legacy records without SDK evidence explicitly report that the collector was
 not checked; they cannot qualify the updated collector. These local file checks
 are not authenticated remote execution or expected-UKI proof.
+
+For an explicitly Secure-Boot-disabled VM, add `--disable-secure-boot` to
+**both** verifier invocations. It requires firmware SecureBoot `00`, still
+requires SetupMode `00` and vTPM, and reports signer membership without
+requiring it. The JSON records `secureBootEnabled: false`. This is basic
+boot/root acceptance, not signature enforcement or remote attestation.
 It requires at least 128 MiB of measured tmpfs block allocation
 and 2,050 new inodes from 128 MiB plus 2,048 small files and reboot markers.
 Reboot acceptance requires a distinct boot ID and loss of the entire workload.
@@ -836,14 +900,17 @@ python3 tests/test_pcr_prediction.py
 python3 tests/test_guest_validation.py
 # On a disposable Ubuntu 24.04 test machine:
 sudo apt-get install -y --no-install-recommends \
-  dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool
+  dracut-core systemd-boot-efi systemd-ukify cryptsetup-bin sbsigntool squashfs-tools
 sudo python3 tests/test_components.py
 ```
 
 The component test creates a real **kernel-less** Dracut/systemd initramfs,
 packages a synthetic kernel payload in a real signed UKI, checks all sections
 and rejects a changed expected command line. It also formats/verifies actual
-verity files and rejects corruption. It does not boot a synthetic or real CVM.
+verity files and rejects corruption. The SquashFS component test runs the
+production packing/copy path, checks extracted metadata and verifies that
+dm-verity rejects corruption in the padded data partition. It does not boot a
+synthetic or real CVM or qualify the pinned kernel's SquashFS driver.
 Missing component-test tools are failures, not skipped checks. CI runs this configuration
 separately on Ubuntu 24.04 without Azure resource creation.
 The predictor tests also compare PCR11 with systemd-measure when available

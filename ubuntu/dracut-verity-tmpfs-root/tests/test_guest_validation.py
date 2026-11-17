@@ -78,6 +78,34 @@ class CollectorTests(unittest.TestCase):
                 target.write_bytes(original)
 
 
+class FirmwareTests(unittest.TestCase):
+    def test_requested_secure_boot_state_is_exact_and_only_enabled_requires_enrollment(self):
+        signer = b"synthetic expected signer" * 20
+        with tempfile.TemporaryDirectory() as directory:
+            efivars = Path(directory)
+            (efivars / f"SetupMode-{guest.GUID}").write_bytes(bytes(5))
+            state = efivars / f"SecureBoot-{guest.GUID}"
+            db = efivars / f"db-{guest.DB_GUID}"
+            for enabled in (True, False):
+                state.write_bytes(bytes(4) + bytes([enabled]))
+                for enrolled in (True, False):
+                    db.write_bytes(bytes(4) + (signer if enrolled else b"other certificate"))
+                    with self.subTest(enabled=enabled, enrolled=enrolled):
+                        if enabled and not enrolled:
+                            with self.assertRaisesRegex(RuntimeError, "not in firmware db"):
+                                guest.verify_firmware(signer, secure_boot=enabled, efivars=efivars)
+                        else:
+                            self.assertIs(guest.verify_firmware(
+                                signer, secure_boot=enabled, efivars=efivars), enrolled)
+                with self.assertRaisesRegex(RuntimeError, "state differs"):
+                    guest.verify_firmware(signer, secure_boot=not enabled, efivars=efivars)
+            db.unlink()
+            self.assertFalse(guest.verify_firmware(signer, secure_boot=False, efivars=efivars))
+            (efivars / f"SetupMode-{guest.GUID}").write_bytes(bytes(4) + b"\x01")
+            with self.assertRaisesRegex(RuntimeError, "Setup Mode"):
+                guest.verify_firmware(signer, secure_boot=False, efivars=efivars)
+
+
 class VerityMountTests(unittest.TestCase):
     def setUp(self):
         self.expected = {
@@ -100,18 +128,28 @@ class VerityMountTests(unittest.TestCase):
             self.assertTrue(kwargs["check"])
             return subprocess.CompletedProcess(args, 0)
 
-        with patch.object(guest, "run", return_value=" ".join(self.table)) as query, \
-                patch.object(guest.subprocess, "run", side_effect=policy) as command:
-            guest.verify_verity_mount(self.expected)
-        query.assert_called_once_with("dmsetup", "table", "root")
-        command.assert_called_once()
+        for filesystem in ("ext4", "squashfs"):
+            with self.subTest(filesystem=filesystem), \
+                    patch.object(guest, "run", side_effect=[filesystem, " ".join(self.table)]) as query, \
+                    patch.object(guest.subprocess, "run", side_effect=policy) as command:
+                guest.verify_verity_mount(dict(self.expected, rootFilesystem=filesystem))
+                self.assertEqual(query.call_count, 2)
+                query.assert_called_with("dmsetup", "table", "root")
+                command.assert_called_once()
+
+    def test_rejects_lower_filesystem_different_from_build_evidence(self):
+        for expected, live in (("ext4", "squashfs"), ("squashfs", "ext4"), ("xfs", "xfs")):
+            with self.subTest(expected=expected, live=live), \
+                    patch.object(guest, "run", return_value=live), \
+                    patch.object(guest.subprocess, "run"), self.assertRaisesRegex(RuntimeError, "filesystem"):
+                guest.verify_verity_mount(dict(self.expected, rootFilesystem=expected))
 
     def test_rejects_wrong_mapper_hash_or_devices_and_failed_mount_policy(self):
         for index, value in ((2, "linear"), (10, "sha512"), (11, "ff" * 32),
                              (4, "8:4"), (5, "8:4")):
             table = self.table.copy()
             table[index] = value
-            with self.subTest(index=index), patch.object(guest, "run", return_value=" ".join(table)), \
+            with self.subTest(index=index), patch.object(guest, "run", side_effect=["ext4", " ".join(table)]), \
                     patch.object(guest.subprocess, "run"), self.assertRaises(RuntimeError):
                 guest.verify_verity_mount(self.expected)
         with patch.object(guest.subprocess, "run", side_effect=subprocess.CalledProcessError(

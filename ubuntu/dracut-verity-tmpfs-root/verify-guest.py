@@ -65,6 +65,10 @@ def verify_attestation_collector(expected, root=Path("/")):
 
 def verify_verity_mount(expected):
     subprocess.run(["/usr/local/libexec/cvm-check-root", "/"], check=True, stdout=sys.stderr)
+    filesystem = expected.get("rootFilesystem", "ext4")
+    require(filesystem in ("ext4", "squashfs"), "Unsupported root filesystem in build evidence")
+    require(run("findmnt", "-rn", "-S", "/dev/mapper/root", "-o", "FSTYPE") == filesystem,
+            "Live lower filesystem differs from build evidence")
     table = run("dmsetup", "table", "root").split()
     require(len(table) >= 13 and table[2:4] == ["verity", "1"], "Unexpected verity table")
     require(table[10] == "sha256" and table[11] == expected["rootHash"], "Live root hash differs from the UKI")
@@ -74,11 +78,24 @@ def verify_verity_mount(expected):
     require(device_number(table[5]) == device_number(hashes), "Wrong live hash device")
 
 
+def verify_firmware(signer, *, secure_boot=True, efivars=Path("/sys/firmware/efi/efivars")):
+    require((efivars / f"SecureBoot-{GUID}").read_bytes()[4:] == bytes([secure_boot]),
+            "Firmware Secure Boot state differs from the requested mode")
+    require((efivars / f"SetupMode-{GUID}").read_bytes()[4:] == b"\x00", "Firmware is in Setup Mode")
+    require(len(signer) > 256, "Invalid expected UKI signer")
+    db = efivars / f"db-{DB_GUID}"
+    enrolled = db.exists() and signer in db.read_bytes()[4:]
+    if secure_boot:
+        require(enrolled, "The expected UKI signer is not in firmware db")
+    return enrolled
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("build_json", type=Path)
     parser.add_argument("signer_der", type=Path)
     parser.add_argument("--previous-boot-id")
+    parser.add_argument("--disable-secure-boot", action="store_true")
     args = parser.parse_args()
     require(os.geteuid() == 0, "Run as root")
     expected = json.loads(args.build_json.read_text())
@@ -89,12 +106,10 @@ def main():
         print("CVM_ATTESTATION_COLLECTOR_NOT_CHECKED: legacy build record lacks SDK evidence",
               file=sys.stderr)
     require(run("uname", "-r") == expected["kernel"], "Kernel does not match build evidence")
-    efivars = Path("/sys/firmware/efi/efivars")
-    require((efivars / f"SecureBoot-{GUID}").read_bytes()[4:] == b"\x01", "Secure Boot is not enabled")
-    require((efivars / f"SetupMode-{GUID}").read_bytes()[4:] == b"\x00", "Firmware is in Setup Mode")
-    cert = args.signer_der.read_bytes()
-    require(len(cert) > 256 and cert in (efivars / f"db-{DB_GUID}").read_bytes(),
-            "The expected UKI signer is not in firmware db")
+    enrolled = verify_firmware(args.signer_der.read_bytes(), secure_boot=not args.disable_secure_boot)
+    if args.disable_secure_boot:
+        print("CVM_SECURE_BOOT_DISABLED: boot/root checks only; no signature enforcement or remote verification",
+              file=sys.stderr)
     require(Path("/sys/class/tpm/tpm0").exists(), "No TPM device")
     cmdline = Path("/proc/cmdline").read_text().split()
     for parameter in (
@@ -102,6 +117,7 @@ def main():
         "systemd.verity_root_data=/dev/disk/by-partuuid/" + expected["dataPartUuid"],
         "systemd.verity_root_hash=/dev/disk/by-partuuid/" + expected["hashPartUuid"],
         "root=/dev/mapper/root", "systemd.volatile=overlay",
+        "rootfstype=" + expected.get("rootFilesystem", "ext4"),
     ):
         require(cmdline.count(parameter) == 1, f"Missing or duplicate expected boot parameter: {parameter}")
     verify_verity_mount(expected)
@@ -136,6 +152,7 @@ def main():
         require(inodes >= 2050, "Workload did not allocate the expected tmpfs inodes")
         workload = {"allocatedBytes": allocated, "allocatedInodes": inodes}
     print(json.dumps({"result": "GUEST_ACCEPTANCE_PASSED", "bootId": boot_id,
+                      "secureBootEnabled": not args.disable_secure_boot, "signerInDb": enrolled,
                       "rootHash": expected["rootHash"], "workload": workload,
                       "attestationSdk": collector,
                       "cloudInit": cloud_init}, indent=2))

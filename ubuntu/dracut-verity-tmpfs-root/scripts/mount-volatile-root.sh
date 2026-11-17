@@ -5,7 +5,10 @@ root=${1:?Expected root mountpoint}
 [[ "$root" = /* && "$root" != / ]]
 base=/run/cvm-overlay
 test ! -e "$base"
-test "$(findmnt -n -o FSTYPE --mountpoint "$root")" = ext4
+case "$(findmnt -n -o FSTYPE --mountpoint "$root")" in
+    ext4|squashfs) ;;
+    *) echo 'CVM_VOLATILE_ROOT_FAILED: expected an ext4 or squashfs lower' >&2; exit 1;;
+esac
 findmnt -rn -S /dev/mapper/root -o TARGET | grep -Fx "$root"
 findmnt -n -o OPTIONS --mountpoint "$root" | grep -Eq '(^|,)ro(,|$)'
 mount -t tmpfs -o mode=0755 tmpfs "$base" --mkdir

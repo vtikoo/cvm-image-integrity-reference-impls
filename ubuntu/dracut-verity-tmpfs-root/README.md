@@ -10,13 +10,14 @@ ubuntu/dracut-verity-tmpfs-root
 
 Build an image from a pinned, unbooted Ubuntu 24.04 CVM Marketplace disk,
 publish it in **your** private Azure Compute Gallery, and launch **your**
-Confidential VM with Secure Boot and vTPM. No access to the original test
+Confidential VM with Secure Boot and vTPM by default. No access to the original test
 resources or signing keys is required.
 
 This independent recipe uses **Dracut/systemd**, not Canonical snap-bootstrap.
 The signed UKI embeds the root hash and both verity partition identifiers.
-The effective root is a writable overlay backed by tmpfs over a read-only
-dm-verity lower; it has no writable disk fallback.
+The effective root is a whole-root writable overlay backed by tmpfs over a
+read-only dm-verity lower: **ext4 by default, optionally gzip-compressed
+SquashFS**. Neither mode has a writable disk fallback.
 
 ### Related reference
 
@@ -24,8 +25,8 @@ See Azure's [AzureStack-Tools Confidential Computing CVM Image Builder](https://
 for another Dracut/systemd, UKI and dm-verity implementation. This recipe is not
 a direct port: that builder creates Ubuntu with `debootstrap`, uses SquashFS and
 limits writable state to selected directories; this recipe preserves the pinned
-Marketplace kernel/modules and uses an ext4 verity lower with a whole-root tmpfs
-overlay.
+Marketplace kernel/modules and retains a whole-root tmpfs overlay with either
+an ext4 or SquashFS verity lower.
 
 **Experimental:** manual Gallery 1.0.4 publication, Intel TDX first/reboot SSH
 acceptance and installed native-collector MAA testing passed. The shared controller
@@ -33,6 +34,10 @@ built/uploaded a fresh image and completed Gallery replication; recovered manage
 first/reboot acceptance and cleanup also passed. An uninterrupted one-command
 deployment has not yet been demonstrated. PCR12/13 token coverage, stateless boot and production-complete
 expected-image remote verification remain unqualified.
+Those earlier Azure results used ext4. SquashFS has now passed managed
+first-boot/reboot acceptance on `Standard_DC4eds_v6` with `VMGuestStateOnly`
+and a managed OS disk; no SquashFS MAA token was collected. The optional
+Secure-Boot-disabled and NVMe-ephemeral configurations still need qualification.
 
 ## Supported baseline
 
@@ -106,6 +111,81 @@ build. The unbooted source is a disk, not a third VM.
 
 The manual workflow remains available through [build-image.sh](build-image.sh).
 Never run image mounts/builds on a shared or production host.
+
+### Choose the verified lower filesystem
+
+The default is `ext4`. Select SquashFS with `--root-filesystem squashfs` on
+`deploy.sh`, or `-RootFilesystem squashfs` on `Deploy.ps1`; add the same option
+to a `--plan` / `-Plan` invocation to preview it. For manual builds, append
+`squashfs` after the source-kernel argument to `build-image.sh`.
+
+Both modes keep **all of `/` writable through the tmpfs upper**, including
+legacy software and agent state; writes disappear at reboot. SquashFS does not
+switch to a selectively writable root or add runtime code-integrity enforcement.
+The build requires the source kernel's SquashFS driver and gzip support and
+includes the matching source driver dependencies in the initramfs. The selected
+filesystem is embedded in the signed command line and checked against build
+evidence during guest acceptance. Regenerate expected PCR4/11 from the resulting
+UKI; do not reuse another build or filesystem mode's image approval.
+
+SquashFS compresses lower-filesystem content, but this option does **not** shrink
+the fixed 32 GiB data partition or Azure fixed VHD. The full data partition,
+including padding, remains protected by dm-verity. Building it also needs an
+uncompressed staging filesystem and a temporary compressed image.
+
+### Optional Secure-Boot-disabled deployment
+
+Secure Boot and vTPM remain enabled by default. Explicitly select
+`--disable-secure-boot` on `deploy.sh` or `-DisableSecureBoot` on `Deploy.ps1`
+to disable **only reference-VM Secure Boot**; the builder remains unchanged.
+For example, append these options to the deployment command:
+
+```text
+--root-filesystem squashfs --disable-secure-boot
+```
+
+The plan records `secureBootEnabled: false`. VM readback and guest acceptance
+must match the requested state on first boot and reboot; vTPM remains required.
+The image is still signed and the Gallery signer profile is still checked,
+but guest acceptance does not require the signer in firmware `db` when Secure
+Boot is off. It reports signer membership rather than treating it as proof of
+signature enforcement. This is a separate choice, never an automatic retry or
+fallback after a Secure Boot failure.
+
+**Basic acceptance is not remote image approval.** With signature enforcement
+off, unapproved code can boot. Withhold secrets until fresh, hardware-bound
+evidence establishes the approved UKI through PCR4 and constrains external
+inputs through authenticated PCR12/13 or qualified input disablement. The
+stock stub accepts external command-line overrides with Secure Boot off; PCR4/11
+alone do not prove the effective verity parameters. The tested MAA tokens omit
+PCR12/13, and this option does not change or weaken any MAA policy. SSH evidence
+collection also requires an endpoint whose authorized policy accepts the mode;
+rejection remains a failure. See the [predictor design](PCR-PREDICTOR-DESIGN.md#secure-boot-disabled-measured-approval-not-execution-prevention).
+
+### Optional ephemeral OS disk
+
+The default remains `VMGuestStateOnly` with a managed OS disk on
+`Standard_DC4es_v6`. Independently select `--ephemeral-os-disk` /
+`-EphemeralOsDisk` for local NVMe OS storage and choose an eligible size, such
+as `--vm-size Standard_DC4eds_v6`. The firmware/TPM guest-state mode is not
+configurable here.
+
+The live `westus3` SKU catalog advertises Intel TDX and NVMe ephemeral OS
+support for `Standard_DC4eds_v6`, unlike `Standard_DC4es_v6`. SKU advertising
+and ARM validation do not establish that a particular custom-image combination
+boots. The controller checks capabilities and actual VM-model readback and
+does not fall back to a managed OS disk. The public ephemeral-disk and
+Secure-Boot-disabled combinations still need end-to-end qualification; do not
+infer it from the default-security managed-disk results.
+
+**Lifecycle differs:** Azure does not support deallocating an ephemeral OS VM.
+After first-boot/reboot acceptance, the controller saves its final boot log,
+deletes the owned reference VM and NIC, and retains the Gallery image and local
+evidence. There is no retained VM or SSH handoff. On failure it also attempts to
+save diagnostics and delete only the owned ephemeral reference, while requesting
+builder deallocation; inspect private evidence for any cleanup failure.
+Managed acceptance does not collect or verify a MAA token. The whole-root tmpfs
+overlay is unchanged by the OS-disk choice.
 
 ## Prerequisites for automatic deployment
 
@@ -242,10 +322,11 @@ placeholders even when previewing.
    without storage account keys or SAS.
 6. Publish the exact public signer plus Microsoft UEFI template. Require
    completed Gallery replication and exact signer/template readback.
-7. Launch a `ConfidentialVM` with Secure Boot, vTPM and `VMGuestStateOnly`;
+7. Launch a `ConfidentialVM` with the requested Secure Boot state, vTPM and `VMGuestStateOnly`;
    verify its actual Azure security/image model.
 8. Stage the independent inputs and verifier through Managed Run Command. Check
-   firmware signer, kernel, live verity/hash/devices and read-only lower mount,
+   firmware state (and signer enrollment when Secure Boot is on), kernel,
+   live verity/hash/devices and read-only lower mount,
    tmpfs, agents/cloud-init and installed collector provenance.
 9. Create the measured volatile workload, remove owned test commands, reboot
    through Azure and restage the verifier. Require a distinct boot ID plus loss
@@ -256,11 +337,13 @@ placeholders even when previewing.
 11. Remove ownership-checked temporary build/upload resources and retain the
     Gallery image plus the **deallocated** reference CVM and local evidence.
     Provide a user-driven SSH/network-configuration handoff without changing
-    the retained VM's networking.
+    the retained VM's networking. With ephemeral OS storage, delete the reference
+    VM and NIC instead; retain only the Gallery image and local evidence.
 
 In optional SSH-validation mode, authenticate the SSH host key through Azure
-boot diagnostics. Stage the verifier and independent inputs; check firmware
-signer, kernel, live verity/hash/devices, read-only lower mount, tmpfs,
+boot diagnostics. Stage the verifier and independent inputs; check requested
+firmware state, signer enrollment when Secure Boot is on, kernel,
+live verity/hash/devices, read-only lower mount, tmpfs,
 agents/cloud-init and installed collector provenance.
 Then authenticate the regenerated host key after reboot and collect from the
 installed SDK with a fresh controller challenge and approved MAA endpoint;
@@ -273,7 +356,8 @@ available as [separately invoked qualification](LOCAL-BUILD.md#optional-disk-qua
 not prerequisites for demonstrating the build/boot flow. Generating the verity
 hash tree is still required.
 
-No path disables Secure Boot, bypasses verity or changes centralized policy.
+Secure Boot is disabled only by explicit opt-in; no path bypasses verity or
+changes centralized policy.
 `VMGuestStateOnly` persists encrypted guest firmware/TPM state; it does not
 request OS-disk encryption or an ephemeral OS disk.
 
@@ -322,7 +406,8 @@ freshness. See [the relying-party requirements](LOCAL-BUILD.md#what-maa-does-and
 ## Failure, retention and cleanup
 
 Failures are explicit. The controller preserves evidence and requests
-deallocation only of VMs whose run ownership is proven; verify the actual state
+deallocation (or ephemeral reference deletion) only of VMs whose run ownership
+is proven; verify the actual state
 and ongoing retained-resource charges. Do not rerun over partial output.
 
 To finish cleanup after a successful validated run:
@@ -352,9 +437,12 @@ needs a new signer/enrollment unless you retained an approved signing service.
 ## Offline expected PCR predictions
 
 After building, [predict-pcrs.py](scripts/predict-pcrs.py) can calculate SHA256
-PCR4, PCR7 and PCR11 from the final signed UKI, its exact signer DER, an
-independently approved/pinned firmware baseline and an explicit PCR11 phase
-path. It also emits all-zero PCR12/13 expectations for a no-external-inputs
+PCR4 and PCR11 from the final signed UKI, its exact signer DER and an explicit
+PCR11 phase path. The default Secure-Boot-enabled mode also predicts PCR7 using
+an independently approved/pinned firmware baseline. Select
+`--disable-secure-boot` to omit PCR7 and baseline inputs; it does not predict
+PCR7 as zero or authenticate the Secure Boot state. Both modes emit all-zero
+PCR12/13 expectations for a no-external-inputs
 policy; these do not prove companion inputs are disabled or supply authenticated
 PCR coverage. It checks the UKI signature and emits JSON with expected PCRs,
 ordered event digests and PCR11 checkpoints. See the
@@ -362,8 +450,9 @@ ordered event digests and PCR11 checkpoints. See the
 
 This is opt-in post-build tooling; default builds and attestation validation
 are unchanged. The supported model is Azure direct-UKI boot with systemd-stub
-255 and exactly one appended custom db signer. Predictions matched the
-retained CVM's MAA-signed PCR4/7/11, but the qualification baseline is **not**
+255; the enabled profile models exactly one appended custom db signer.
+Enabled-profile predictions matched the retained CVM's MAA-signed PCR4/7/11,
+but the qualification baseline is **not**
 a production-approved Microsoft factory template. Do not learn expected
 values from the CVM being evaluated or treat this calculator as a complete
 remote-attestation verifier.
@@ -377,8 +466,8 @@ remote-attestation verifier.
   root is **not immutable**. Budget RAM for agents and workloads; do not add swap.
 - Re-authenticate regenerated host keys. Never disable strict host-key checking
   or blindly accept an `ssh-keyscan` result.
-- `NonPersistedTPM` remains blocked in the tested custom-key configuration.
-  Do not disable Secure Boot to make a failed image boot.
+- Secure Boot is disabled only by explicit opt-in. Boot success in that mode
+  is not signature-enforcement or remote-attestation qualification.
 - The tested custom-policy MAA token covers PCRs 0-8 and 11, **not PCR12/13**.
   Keep PCR12/13 in the request and do not claim complete coverage.
 - No production-complete root-hash attestation, rollback protection,

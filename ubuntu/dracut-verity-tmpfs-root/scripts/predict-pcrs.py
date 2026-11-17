@@ -17,6 +17,7 @@ from image_policy import pe_section_data
 
 
 BOOT_PROFILE = "azure-direct-uki-v1"
+NO_SECURE_BOOT_PROFILE = "azure-direct-uki-no-secureboot-v1"
 GLOBAL_GUID = uuid.UUID("8be4df61-93ca-11d2-aa0d-00e098032b8c")
 SECURITY_GUID = uuid.UUID("d719b2cb-3d3a-4596-a3bc-dad00e67656f")
 X509_GUID = uuid.UUID("a5c059a1-94e4-4aa7-87b5-ab155c2bf072")
@@ -202,14 +203,18 @@ def phase_names(path):
     return names
 
 
-def predict(uki, certificate, baseline, phase_path):
+def predict(uki, certificate, baseline, phase_path, *, secure_boot=True):
     image = PEImage(uki)
-    values, owner = baseline
-    require(not any(kind == X509_GUID and value == certificate
-                    for kind, _, value in signature_entries(values["db"])),
-            "Custom signer is already in the baseline db")
+    if secure_boot:
+        require(baseline is not None, "Secure Boot prediction requires a pinned firmware baseline")
+        values, owner = baseline
+        require(not any(kind == X509_GUID and value == certificate
+                        for kind, _, value in signature_entries(values["db"])),
+                "Custom signer is already in the baseline db")
+    else:
+        require(baseline is None, "Disabled Secure Boot prediction does not evaluate a firmware baseline")
     phases = phase_names(phase_path)
-    events = {str(index): [] for index in (4, 7, 11, 12, 13)}
+    events = {str(index): [] for index in ((4, 7, 11, 12, 13) if secure_boot else (4, 11, 12, 13))}
     pcrs = {index: bytes(32) for index in events}
 
     def extend(index, label, digest):
@@ -221,14 +226,15 @@ def predict(uki, certificate, baseline, phase_path):
            sha256(b"Calling EFI Application from Boot Option"))
     extend(4, "EV_SEPARATOR", sha256(bytes(4)))
     extend(4, "signed UKI Authenticode", image.authenticode())
-    for name in VARIABLES:
-        value = values[name]
-        if name == "db":
-            value += certificate_list(owner, certificate)
-        extend(7, name, sha256(variable(
-            GLOBAL_GUID if name in ("SecureBoot", "PK", "KEK") else SECURITY_GUID, name, value)))
-    extend(7, "EV_SEPARATOR", sha256(bytes(4)))
-    extend(7, "db authority", sha256(variable(SECURITY_GUID, "db", owner.bytes_le + certificate)))
+    if secure_boot:
+        for name in VARIABLES:
+            value = values[name]
+            if name == "db":
+                value += certificate_list(owner, certificate)
+            extend(7, name, sha256(variable(
+                GLOBAL_GUID if name in ("SecureBoot", "PK", "KEK") else SECURITY_GUID, name, value)))
+        extend(7, "EV_SEPARATOR", sha256(bytes(4)))
+        extend(7, "db authority", sha256(variable(SECURITY_GUID, "db", owner.bytes_le + certificate)))
     for name in MEASURED_SECTIONS:
         if name in image.sections and image.sections[name][2]:
             extend(11, name + " name including NUL", sha256(name.encode("ascii") + b"\0"))
@@ -238,7 +244,9 @@ def predict(uki, certificate, baseline, phase_path):
         extend(11, "phase " + name, sha256(name.encode("ascii")))
         checkpoints.append({"phasePath": ":".join(phases[:index + 1]), "value": pcrs["11"].hex()})
     return {
-        "schemaVersion": 1, "bank": "sha256", "bootProfile": BOOT_PROFILE,
+        "schemaVersion": 1, "bank": "sha256",
+        "bootProfile": BOOT_PROFILE if secure_boot else NO_SECURE_BOOT_PROFILE,
+        "pcr7Policy": "firmware-baseline" if secure_boot else "not-evaluated",
         "stubModel": "systemd-255", "phasePath": phase_path,
         "externalInputPolicy": "no-external-inputs",
         "pcrs": {index: value.hex() for index, value in pcrs.items()},
@@ -253,21 +261,31 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--uki", required=True, type=Path)
     parser.add_argument("--signer-der", required=True, type=Path)
-    parser.add_argument("--firmware-baseline", required=True, type=Path)
-    parser.add_argument("--firmware-baseline-sha256", required=True)
+    parser.add_argument("--disable-secure-boot", action="store_true",
+                        help="Omit PCR7 and firmware-baseline inputs; does not attest Secure Boot state")
+    parser.add_argument("--firmware-baseline", type=Path)
+    parser.add_argument("--firmware-baseline-sha256")
     parser.add_argument("--phase-path", required=True,
                         help="Expected ordered PCR11 phases, e.g. sysinit:ready; empty means UKI only")
     args = parser.parse_args()
+    if args.disable_secure_boot:
+        if args.firmware_baseline is not None or args.firmware_baseline_sha256 is not None:
+            parser.error("--disable-secure-boot does not accept firmware-baseline inputs")
+    elif args.firmware_baseline is None or args.firmware_baseline_sha256 is None:
+        parser.error("Secure Boot prediction requires --firmware-baseline and --firmware-baseline-sha256")
     try:
-        baseline_data = args.firmware_baseline.read_bytes()
-        baseline = load_baseline(baseline_data, args.firmware_baseline_sha256)
+        baseline = None
+        if not args.disable_secure_boot:
+            baseline_data = args.firmware_baseline.read_bytes()
+            baseline = load_baseline(baseline_data, args.firmware_baseline_sha256)
         uki, certificate = args.uki.read_bytes(), args.signer_der.read_bytes()
-        result = predict(uki, certificate, baseline, args.phase_path)
+        result = predict(uki, certificate, baseline, args.phase_path, secure_boot=not args.disable_secure_boot)
         verify_signer(uki, certificate)
         result["inputs"] = {
             "ukiSha256": sha256(uki).hex(), "signerDerSha256": sha256(certificate).hex(),
-            "firmwareBaselineSha256": sha256(baseline_data).hex(),
         }
+        if not args.disable_secure_boot:
+            result["inputs"]["firmwareBaselineSha256"] = sha256(baseline_data).hex()
     except (OSError, ValueError, struct.error) as error:
         parser.exit(2, f"PCR prediction failed: {error}\n")
     print(json.dumps(result, indent=2))

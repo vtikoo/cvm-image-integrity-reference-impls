@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import struct
 import sys
 import time
@@ -67,6 +68,14 @@ def upload(path, url, expected, root_hash, record=None):
                     time.sleep(20)
                     continue
                 raise RuntimeError(f"Managed-identity blob {method} failed (HTTP {error.code})") from None
+            except urllib.error.URLError as error:
+                if not (isinstance(error.reason, socket.gaierror) and error.reason.errno == socket.EAI_AGAIN):
+                    raise
+                if attempt == 17:
+                    raise RuntimeError(f"Managed-identity blob {method} failed (temporary DNS failure)") from None
+                print(f"WARNING: temporary DNS failure during blob {method}; retrying in 20 seconds",
+                      file=sys.stderr)
+                time.sleep(20)
         raise RuntimeError("Managed-identity storage retries exhausted")
 
     request("PUT", data=b"", headers={

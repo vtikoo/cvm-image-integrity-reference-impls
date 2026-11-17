@@ -11,7 +11,8 @@ RECIPE = Path(__file__).resolve().parents[1]
 class ShellEntrypointTests(unittest.TestCase):
     def test_deployment_and_cleanup_forward_paths_and_propagate_failures(self):
         for script, action, arguments in (
-            ("deploy.sh", "deploy", ["--run-directory", "/private/run with spaces", "--plan"]),
+            ("deploy.sh", "deploy", ["--run-directory", "/private/run with spaces",
+                                    "--root-filesystem", "squashfs", "--disable-secure-boot", "--plan"]),
             ("cleanup.sh", "cleanup", ["--run-directory", "/private/run with spaces", "--remove-run"]),
         ):
             for status in (0, 17):

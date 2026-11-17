@@ -124,8 +124,8 @@ def configuration(args):
             "Invalid new dedicated resource-group name")
     require(re.fullmatch(r"[a-z][a-z0-9-]{2,11}", args.prefix), "Prefix must be 3-12 lowercase characters")
     require(re.fullmatch(r"[a-z][a-z0-9]+", args.location), "Invalid Azure location")
-    require(re.fullmatch(r"Standard_DC[0-9]+es_v6", args.vm_size),
-            "The reference must use an Intel TDX DCes_v6 size")
+    require(re.fullmatch(r"Standard_DC[0-9]+ed?s_v6", args.vm_size),
+            "The reference must use an Intel TDX DCes_v6 or DCeds_v6 size")
     require(re.fullmatch(r"Canonical:ubuntu-24_04-lts:server:24\.04\.[0-9]+", args.builder_image),
             "Builder must use a pinned standard Canonical Ubuntu 24.04 server image")
     key_path = Path(args.ssh_public_key).expanduser().resolve()
@@ -157,6 +157,9 @@ def configuration(args):
         "purpose": PURPOSE, "location": args.location, "vmSize": args.vm_size,
         "builderVmSize": "Standard_D8s_v5", "builderImage": args.builder_image,
         "sourceImage": inputs["imageUrn"], "maximumVms": 2, "adminUsername": "cvmadmin",
+        "rootFilesystem": args.root_filesystem,
+        "secureBootEnabled": not args.disable_secure_boot,
+        "ephemeralOsDisk": args.ephemeral_os_disk,
         "builderVm": prefix + "-builder", "referenceVm": prefix + "-reference",
         "sourceDisk": prefix + "-source", "network": prefix + "-vnet", "subnet": "cvm",
         "networkSecurityGroup": prefix + "-nsg", "natGateway": prefix + "-nat",
@@ -172,7 +175,9 @@ def configuration(args):
         "sshJumpKnownHosts": str(Path(args.ssh_jump_known_hosts).expanduser().resolve())
         if args.ssh_jump_known_hosts else None,
         "privateConnectivity": (
-            "Managed validation needs no inbound route; user must confirm/configure network access for later SSH"
+            ("Managed validation needs no inbound route; ephemeral reference is deleted after acceptance"
+             if args.ephemeral_os_disk else
+             "Managed validation needs no inbound route; user must confirm/configure network access for later SSH")
             if args.validation_transport == "managed" else
             "SSH validation requires an approved route to the new private subnet"),
         "attestationVerification": "NOT_VERIFIED: collection only; PCR12/13 token coverage may be absent",
@@ -270,8 +275,10 @@ def base_id(config):
     return f"/subscriptions/{config['subscriptionId']}/resourceGroups/{config['resourceGroup']}"
 
 
-def validate_acceptance(value, build, previous=None):
+def validate_acceptance(value, build, previous=None, *, secure_boot=True):
     require(value.get("result") == "GUEST_ACCEPTANCE_PASSED", "Guest acceptance did not pass")
+    # Legacy acceptance records came from a Secure-Boot-on-only verifier.
+    require(value.get("secureBootEnabled", True) is secure_boot, "Guest Secure Boot mode differs from request")
     boot = str(uuid.UUID(value["bootId"]))
     require(value.get("rootHash") == build["rootHash"] and value.get("attestationSdk") == build["attestationSdk"],
             "Guest provenance differs from independent build evidence")
@@ -445,6 +452,15 @@ class Engine:
                 "VM SKU is restricted/unavailable for a non-zonal deployment")
             sku = matches[0]
             capabilities = {item["name"]: item["value"] for item in sku["capabilities"]}
+            if size == self.c["vmSize"]:
+                require(capabilities.get("ConfidentialComputingType") == "TDX",
+                        "Reference SKU must advertise Intel TDX")
+                if self.c.get("ephemeralOsDisk", False):
+                    require(capabilities.get("EphemeralOSDiskSupported") == "True"
+                            and "NvmeDisk" in capabilities.get(
+                                "SupportedEphemeralOSDiskPlacements", "").split(",")
+                            and int(capabilities.get("NvmeDiskSizeInMiB", "0")) >= 64 * 1024,
+                            "Reference SKU must support a 64 GiB NVMe ephemeral OS disk")
             cpus = int(capabilities["vCPUs"])
             needs[sku["family"].lower()] = needs.get(sku["family"].lower(), 0) + cpus
             needs["cores"] += cpus
@@ -536,9 +552,15 @@ class Engine:
                 "securityType": "TrustedLaunch", "uefiSettings": {"secureBootEnabled": True, "vTpmEnabled": True}}
         else:
             body["properties"]["securityProfile"] = {
-                "securityType": "ConfidentialVM", "uefiSettings": {"secureBootEnabled": True, "vTpmEnabled": True}}
+                "securityType": "ConfidentialVM", "uefiSettings": {
+                    "secureBootEnabled": c.get("secureBootEnabled", True), "vTpmEnabled": True}}
             body["properties"]["storageProfile"]["osDisk"]["managedDisk"]["securityProfile"] = {
                 "securityEncryptionType": "VMGuestStateOnly"}
+            if c.get("ephemeralOsDisk", False):
+                body["properties"]["storageProfile"]["osDisk"].update({
+                    "diffDiskSettings": {"option": "Local", "placement": "NvmeDisk"},
+                    "caching": "ReadOnly", "deleteOption": "Delete",
+                })
         ident = base_id(c) + "/providers/Microsoft.Compute/virtualMachines/" + name
         self.rest("put", ident, body)
         self.poll(lambda: self.vm(role), lambda vm: vm.get("provisioningState") == "Succeeded", "VM creation")
@@ -550,19 +572,37 @@ class Engine:
         if role == "reference":
             self.check_reference_model(model)
         self.record(role + "-model", model)
-        # Tag every automatically generated resource that we will later delete.
-        for resource_id in (model["storageProfile"]["osDisk"]["managedDisk"]["id"],):
-            self.az("tag", "update", "--resource-id", resource_id, "--operation", "Merge",
+        # Ephemeral disks may expose a logical ID without a managed disk resource.
+        ephemeral = role == "reference" and c.get("ephemeralOsDisk", False)
+        disk_id = model["storageProfile"]["osDisk"]["managedDisk"].get("id")
+        require(disk_id or ephemeral,
+                "Persisted VM must have a managed OS disk ID")
+        if disk_id and not ephemeral:
+            self.az("tag", "update", "--resource-id", disk_id, "--operation", "Merge",
                     "--tags", *self.tags(role))
 
     def check_reference_model(self, model):
         p = model["securityProfile"]
         osdisk = model["storageProfile"]["osDisk"]
         require(p["securityType"] == "ConfidentialVM" and p["uefiSettings"] == {
-            "secureBootEnabled": True, "vTpmEnabled": True},
-            "Actual reference must have ConfidentialVM, Secure Boot and vTPM")
+            "secureBootEnabled": self.c.get("secureBootEnabled", True), "vTpmEnabled": True},
+            "Actual reference must have ConfidentialVM, requested Secure Boot state and vTPM")
+        ephemeral = self.c.get("ephemeralOsDisk", False)
+        settings = osdisk.get("diffDiskSettings", {})
+        if ephemeral:
+            require(settings.get("option") == "Local" and settings.get("placement") == "NvmeDisk"
+                    and osdisk.get("caching") == "ReadOnly",
+                    "Actual reference must use an NVMe ephemeral OS disk, not a persisted disk")
+            disk_id = osdisk["managedDisk"].get("id")
+            require(not disk_id or disk_id.lower() == (
+                base_id(self.c) + "/providers/Microsoft.Compute/disks/"
+                + self.c["referenceVm"] + "-os").lower(),
+                "Unexpected ephemeral OS disk resource ID")
+        else:
+            require(settings.get("option") is None, "Actual reference unexpectedly uses an ephemeral OS disk")
         disk_size = osdisk.get("diskSizeGB", osdisk.get("diskSizeGb"))
         if disk_size is None:
+            require(not ephemeral, "Ephemeral OS disk size is missing from VM readback")
             disk_id = osdisk["managedDisk"]["id"]
             require(disk_id.lower() == (base_id(self.c) + "/providers/Microsoft.Compute/disks/"
                                        + self.c["referenceVm"] + "-os").lower(),
@@ -572,8 +612,9 @@ class Engine:
             self.record("reference-disk", disk)
             disk_size = disk.get("diskSizeGB", disk.get("diskSizeGb"))
         require(type(disk_size) is int and disk_size == 64 and
-                osdisk["managedDisk"]["securityProfile"]["securityEncryptionType"] == "VMGuestStateOnly",
-                "Actual reference OS disk must be 64 GiB VMGuestStateOnly")
+                osdisk["managedDisk"]["securityProfile"]["securityEncryptionType"] ==
+                "VMGuestStateOnly",
+                "Actual reference OS disk size or security encryption type differs from request")
         require(model["storageProfile"]["imageReference"]["id"].lower() == version_id(self.c).lower(),
                 "Reference did not use the accepted Gallery image")
         require(model["hardwareProfile"]["vmSize"] == self.c["vmSize"], "Reference SKU mismatch")
@@ -767,7 +808,7 @@ class Engine:
             "-C /opt/cvm-dracut/checkout/ubuntu/dracut-verity-tmpfs-root\n"
             "cat > /var/lib/cvm-dracut/builder.sh <<'CVM_BUILDER_SCRIPT'\n"
             + (RECIPE / "scripts/deployment-builder.sh").read_text() + "\nCVM_BUILDER_SCRIPT\n"
-            "bash /var/lib/cvm-dracut/builder.sh provision\n")
+            "bash /var/lib/cvm-dracut/builder.sh provision " + shlex.quote(self.c["rootFilesystem"]) + "\n")
         self.managed("provision", stage, "DRACUT_BUILDER_PROVISIONED", timeout=3600)
         if self.c.get("validationTransport", "ssh") == "ssh":
             self.bootstrap("builder", "first")
@@ -783,7 +824,8 @@ class Engine:
             "lun": 0, "name": self.c["sourceDisk"], "createOption": "Attach", "managedDisk": {"id": disk["id"]},
             "caching": "ReadOnly", "deleteOption": "Detach",
         }]}}})
-        self.managed("build", "bash /var/lib/cvm-dracut/builder.sh build\n",
+        self.managed("build", "bash /var/lib/cvm-dracut/builder.sh build "
+                     + shlex.quote(self.c["rootFilesystem"]) + "\n",
                      "DRACUT_DEPLOYMENT_BUILD_PASSED", timeout=14400)
         root = "/var/lib/cvm-dracut"
         for remote, local in (
@@ -801,6 +843,8 @@ class Engine:
         return build, provenance, profile
 
     def validate_build(self, build, provenance, manifest):
+        require(build.get("rootFilesystem", "ext4") == self.c.get("rootFilesystem", "ext4")
+                == provenance.get("rootFilesystem", "ext4"), "Build root filesystem differs from requested policy")
         require(provenance.get("result") == "DRACUT_DEPLOYMENT_BUILD_PASSED"
                 and provenance.get("recipeFiles") == manifest, "Final builder provenance/recipe manifest mismatch")
         require(provenance.get("sourceMatchesOriginal") is True
@@ -940,10 +984,13 @@ class Engine:
             require(actual == digest(content), "Staged acceptance artifact hash mismatch")
         remote = "sudo python3 " + " ".join(shlex.quote(root + "/" + name)
                                           for name in ("verify-guest.py", "build.json", "signer.der"))
+        if not self.c.get("secureBootEnabled", True):
+            remote += " --disable-secure-boot"
         first = self.ssh("reference", remote)
         private_write(self.evidence / "acceptance-first.json", first.stdout)
         before = json.loads(first.stdout)
-        require(validate_acceptance(before, build) == first_boot, "First acceptance boot UUID is stale")
+        require(validate_acceptance(before, build, secure_boot=self.c.get("secureBootEnabled", True)) == first_boot,
+                "First acceptance boot UUID is stale")
         # A reboot is requested over the already authenticated SSH session.
         self.ssh("reference", "sudo systemd-run --unit=cvm-controller-reboot --on-active=3s /usr/sbin/reboot")
         after_boot = self.bootstrap("reference", "reboot", previous=first_boot)
@@ -956,7 +1003,8 @@ class Engine:
             require(actual == digest(path.read_bytes()), "Reboot acceptance staging hash mismatch")
         after = self.ssh("reference", remote + " --previous-boot-id " + shlex.quote(first_boot))
         private_write(self.evidence / "acceptance-reboot.json", after.stdout)
-        require(validate_acceptance(json.loads(after.stdout), build, first_boot) == after_boot,
+        require(validate_acceptance(json.loads(after.stdout), build, first_boot,
+                                    secure_boot=self.c.get("secureBootEnabled", True)) == after_boot,
                 "Reboot acceptance boot UUID is stale")
         nonce = secrets.token_hex(32)
         write_json(self.evidence / "challenge.json", {"nonceHex": nonce, "endpoint": self.c["maaEndpoint"],
@@ -979,6 +1027,7 @@ class Engine:
         missing = validate_receipt(receipt, nonce, build)
         self.record("acceptance-complete", {
             "result": "ACCEPTANCE_COMPLETE", "runId": self.c["runId"], "beforeBootId": first_boot,
+            "secureBootEnabled": self.c.get("secureBootEnabled", True),
             "afterBootId": after_boot, "buildSha256": digest((self.evidence / "build.json").read_bytes()),
             "signerSha256": digest((self.evidence / "signer.der").read_bytes()),
             "attestationVerification": receipt["verification"], "tokenMissingRequestedPcrs": missing,
@@ -1003,6 +1052,8 @@ class Engine:
                 script += "echo " + shlex.quote(digest(data) + "  " + root + "/" + name) + " | sha256sum -c -\n"
             script += "python3 " + " ".join(shlex.quote(root + "/" + name)
                                           for name in ("verify-guest.py", "build.json", "signer.der"))
+            if not self.c.get("secureBootEnabled", True):
+                script += " --disable-secure-boot"
             if previous:
                 script += " --previous-boot-id " + shlex.quote(previous)
             script += " > " + shlex.quote(root + "/acceptance.json") + "\necho CVM_MANAGED_ACCEPTANCE_PASSED\n"
@@ -1010,7 +1061,8 @@ class Engine:
                          timeout=1800, role="reference")
             content = self.retrieve("reference", root + "/acceptance.json",
                                     self.evidence / ("acceptance-" + phase + ".json"))
-            boot = validate_acceptance(json.loads(content), build, previous)
+            boot = validate_acceptance(json.loads(content), build, previous,
+                                       secure_boot=self.c.get("secureBootEnabled", True))
             self.remove_reference_commands()
             if phase == "first":
                 previous = boot
@@ -1018,11 +1070,15 @@ class Engine:
                         timeout=600)
         self.record("acceptance-complete", {
             "result": "ACCEPTANCE_COMPLETE", "runId": self.c["runId"],
+            "secureBootEnabled": self.c.get("secureBootEnabled", True),
             "validationTransport": "managed", "beforeBootId": previous, "afterBootId": boot,
             "buildSha256": digest((self.evidence / "build.json").read_bytes()),
             "signerSha256": digest((self.evidence / "signer.der").read_bytes()),
-            "attestationCollection": "DEFERRED_TO_SSH",
-            "attestationVerification": "NOT_RUN: invoke the installed collector over authenticated SSH after start",
+            "attestationCollection": "NOT_RUN" if self.c.get("ephemeralOsDisk", False) else "DEFERRED_TO_SSH",
+            "attestationVerification": (
+                "NOT_RUN: ephemeral reference is deleted after managed acceptance; no MAA token collected"
+                if self.c.get("ephemeralOsDisk", False) else
+                "NOT_RUN: invoke the installed collector over authenticated SSH after start"),
             "limitations": ["Managed basic acceptance does not test SSH connectivity or obtain an MAA token",
                             "Expected-image remote verification and PCR12/13 token coverage remain unqualified"],
         })
@@ -1055,6 +1111,8 @@ class Engine:
                     "Retained attestation artifact hash differs from authenticated retrieval")
 
     def deallocate(self, role, wait=True):
+        require(not (role == "reference" and self.c.get("ephemeralOsDisk", False)),
+                "Ephemeral OS VMs cannot be deallocated; delete the owned test instance instead")
         self.owned_group()
         self.vm(role)
         self.az("vm", "deallocate", "-g", self.c["resourceGroup"], "-n", self.c[role + "Vm"],
@@ -1068,10 +1126,29 @@ class Engine:
                                               for status in item.get("instanceView", {}).get("statuses", [])),
                       "VM deallocation", timeout=600)
 
+    def delete_ephemeral_reference(self):
+        require(self.c.get("ephemeralOsDisk", False), "Ephemeral reference deletion was not requested")
+        self.owned_group()
+        self.record("reference-before-deletion", self.vm("reference"))
+        try:
+            log = self.az("vm", "boot-diagnostics", "get-boot-log",
+                          "-g", self.c["resourceGroup"], "-n", self.c["referenceVm"], raw=True)
+            self.record("reference-final-boot-log", {"log": log})
+        except DeploymentError as error:
+            self.record("reference-final-boot-log", {"error": str(error)})
+            print("WARNING: boot log retrieval failed before ephemeral VM deletion: " + str(error),
+                  file=sys.stderr)
+        self.az("vm", "delete", "-g", self.c["resourceGroup"], "-n", self.c["referenceVm"],
+                "--yes", timeout=1800)
+        require(not any(item["name"] == self.c["referenceVm"]
+                        for item in self.az("vm", "list", "-g", self.c["resourceGroup"])),
+                "Ephemeral reference VM remains after deletion")
+        self.record("reference-deletion", {"confirmed": True, "localEvidenceRetained": True})
+
     def failure(self, error):
         self.record("failure", {"result": "DEPLOYMENT_FAILED", "error": str(error),
-                                "evidencePreserved": True, "deallocation": "not yet confirmed"})
-        print("DEPLOYMENT_FAILED; preserving private evidence and resources at " + str(self.run), file=sys.stderr)
+                                "evidencePreserved": True, "vmCleanup": "not yet confirmed"})
+        print("DEPLOYMENT_FAILED; preserving private evidence at " + str(self.run), file=sys.stderr)
         if not self.group_created:
             return
         try:
@@ -1084,13 +1161,18 @@ class Engine:
             matches = [item for item in inventory if item["name"] == self.c[role + "Vm"]]
             if not matches:
                 continue
+            ephemeral = role == "reference" and self.c.get("ephemeralOsDisk", False)
+            operation = "deletion" if ephemeral else "deallocation"
             try:
                 self.owned(matches[0], role)
-                self.deallocate(role, wait=False)
-                self.record(role + "-failure-deallocation", {"requested": True, "confirmed": False})
+                if ephemeral:
+                    self.delete_ephemeral_reference()
+                else:
+                    self.deallocate(role, wait=False)
+                self.record(role + "-failure-" + operation, {"requested": True, "confirmed": ephemeral})
             except DeploymentError as deallocation_error:
-                self.record(role + "-failure-deallocation", {"requested": False, "error": str(deallocation_error)})
-                print("WARNING: owned VM deallocation failed: " + str(deallocation_error), file=sys.stderr)
+                self.record(role + "-failure-" + operation, {"confirmed": False, "error": str(deallocation_error)})
+                print("WARNING: owned VM " + operation + " failed: " + str(deallocation_error), file=sys.stderr)
 
     def acceptance_gate(self):
         summary = read_json(self.evidence / "acceptance-complete.json")
@@ -1100,16 +1182,20 @@ class Engine:
         require(summary.get("buildSha256") == digest((self.evidence / "build.json").read_bytes())
                 and summary.get("signerSha256") == digest((self.evidence / "signer.der").read_bytes()),
                 "Acceptance independent input hashes changed")
-        before = validate_acceptance(read_json(self.evidence / "acceptance-first.json"), build)
-        after = validate_acceptance(read_json(self.evidence / "acceptance-reboot.json"), build, before)
+        secure_boot = self.c.get("secureBootEnabled", True)
+        before = validate_acceptance(read_json(self.evidence / "acceptance-first.json"), build,
+                                     secure_boot=secure_boot)
+        after = validate_acceptance(read_json(self.evidence / "acceptance-reboot.json"), build, before,
+                                    secure_boot=secure_boot)
+        require(summary.get("secureBootEnabled", True) is secure_boot, "Acceptance Secure Boot mode changed")
         require(summary.get("beforeBootId") == before and summary.get("afterBootId") == after,
                 "Acceptance boot evidence changed")
         transport = self.c.get("validationTransport", "ssh")
         require(summary.get("validationTransport", "ssh") == transport, "Acceptance transport changed")
         if transport == "managed":
-            require(summary.get("attestationCollection") == "DEFERRED_TO_SSH"
+            require(summary.get("attestationCollection") in ("NOT_RUN", "DEFERRED_TO_SSH")
                     and summary.get("attestationVerification", "").startswith("NOT_RUN:"),
-                    "Managed acceptance must explicitly defer attestation to SSH")
+                    "Managed acceptance must explicitly defer attestation or report it was not run")
         else:
             challenge = read_json(self.evidence / "challenge.json")
             require(challenge["bootId"] == after and challenge["endpoint"] == self.c["maaEndpoint"],
@@ -1136,8 +1222,18 @@ class Engine:
             self.record("cleanup-summary", {"resourceGroupDeleted": True, "localEvidenceRetained": True})
             return
         self.acceptance_gate()
-        self.check_reference_model(self.vm("reference"))
-        self.deallocate("reference")
+        ephemeral = self.c.get("ephemeralOsDisk", False)
+        if ephemeral:
+            inventory = self.az("vm", "list", "-g", self.c["resourceGroup"])
+            if any(item["name"] == self.c["referenceVm"] for item in inventory):
+                self.check_reference_model(self.vm("reference"))
+                self.delete_ephemeral_reference()
+            else:
+                self.check_reference_model(self.owned(
+                    read_json(self.evidence / "reference-model.json"), "reference"))
+        else:
+            self.check_reference_model(self.vm("reference"))
+            self.deallocate("reference")
         inventory = self.az("vm", "list", "-g", self.c["resourceGroup"])
         builders = [item for item in inventory if item["name"] == self.c["builderVm"]]
         if builders:
@@ -1167,20 +1263,29 @@ class Engine:
             self.az("vm", "delete", "-g", self.c["resourceGroup"], "-n", self.c["builderVm"], "--yes", timeout=1800)
         # Inspect actual inventory before deleting: cleanup is safely repeatable.
         resources = self.az("resource", "list", "-g", self.c["resourceGroup"])
-        for name, role in ((self.c["builderVm"] + "-nic", "builder"), (self.c["builderVm"] + "-os", "builder"),
-                           (self.c["sourceDisk"], "source"), (self.c["storageAccount"], "upload")):
+        temporary_resources = [
+            (self.c["builderVm"] + "-nic", "builder"), (self.c["builderVm"] + "-os", "builder"),
+            (self.c["sourceDisk"], "source"), (self.c["storageAccount"], "upload"),
+        ]
+        if ephemeral:
+            temporary_resources.append((self.c["referenceVm"] + "-nic", "reference"))
+        for name, role in temporary_resources:
             for resource in resources:
                 if resource["name"] == name:
                     self.delete_owned_resource(resource["id"], role)
         remaining = self.az("resource", "list", "-g", self.c["resourceGroup"])
         temporary = {self.c["builderVm"], self.c["builderVm"] + "-nic", self.c["builderVm"] + "-os",
                      self.c["sourceDisk"], self.c["storageAccount"]}
+        if ephemeral:
+            temporary.update((self.c["referenceVm"], self.c["referenceVm"] + "-nic"))
         require(not any(item["name"] in temporary for item in remaining), "Temporary resources remain after cleanup")
         vms = self.az("vm", "list", "-g", self.c["resourceGroup"])
-        require(len(vms) == 1 and vms[0]["name"] == self.c["referenceVm"], "Unexpected retained VM inventory")
-        self.record("cleanup-summary", {"temporaryResourcesDeleted": True, "referenceDeallocated": True,
+        require(not vms if ephemeral else len(vms) == 1 and vms[0]["name"] == self.c["referenceVm"],
+                "Unexpected retained VM inventory")
+        self.record("cleanup-summary", {"temporaryResourcesDeleted": True, "referenceDeallocated": not ephemeral,
+                                       "referenceDeleted": ephemeral,
                                        "galleryVersion": version_id(self.c), "resources": remaining,
-                                       "sshAccess": "USER_CONFIRMATION_REQUIRED",
+                                       "sshAccess": "NO_VM_RETAINED" if ephemeral else "USER_CONFIRMATION_REQUIRED",
                                        "referenceVm": self.c["referenceVm"],
                                        "resourceGroup": self.c["resourceGroup"]})
 
@@ -1218,6 +1323,12 @@ def parser():
     deploy.add_argument("--network-address-prefix", default="10.73.0.0/24")
     deploy.add_argument("--subnet-prefix", default="10.73.0.0/26")
     deploy.add_argument("--builder-image", default=BUILDER_IMAGE, help="Pinned standard Ubuntu 24.04 server URN")
+    deploy.add_argument("--root-filesystem", choices=("ext4", "squashfs"), default="ext4",
+                        help="Verified lower filesystem; both retain the whole-root tmpfs overlay")
+    deploy.add_argument("--disable-secure-boot", action="store_true",
+                        help="Explicitly disable reference Secure Boot; vTPM remains enabled; not attestation qualification")
+    deploy.add_argument("--ephemeral-os-disk", action="store_true",
+                        help="Use NVMe ephemeral OS storage; delete the test VM after acceptance, retaining Gallery/evidence")
     deploy.add_argument("--plan", action="store_true")
     cleanup = subs.add_parser("cleanup")
     cleanup.add_argument("--run-directory", required=True)
@@ -1233,6 +1344,9 @@ def main(argv=None):
         if args.plan:
             print(json.dumps(config, indent=2))
             return 0
+        if not config["secureBootEnabled"]:
+            print("WARNING: reference Secure Boot is disabled; basic acceptance is not remote image verification. "
+                  "Require authenticated PCR4 and external-input coverage before releasing secrets.", file=sys.stderr)
         ssh_validation = args.validation_transport == "ssh"
         if ssh_validation:
             require(args.ssh_private_key, "SSH validation requires --ssh-private-key")
@@ -1273,11 +1387,15 @@ def main(argv=None):
         if os.name == "nt":
             print("WARNING: Windows ACLs are inherited; the run directory's parent must already be restricted to the operator. POSIX modes do not enforce Windows ACLs.", file=sys.stderr)
         Engine(config, str(private) if private else None).deploy()
-        attestation = "NOT_VERIFIED" if ssh_validation else "NOT_RUN; collect over authenticated SSH after start"
-        print("DEPLOYMENT_ACCEPTED: Gallery retained; reference deallocated; attestation " + attestation + "; evidence=" + str(run))
-        print("SSH_HANDOFF: VM=" + config["resourceGroup"] + "/" + config["referenceVm"]
-              + "; confirm or reconfigure approved network access before user-driven SSH/SDK testing."
-              + " Start the VM when needed and authenticate its current host key through Azure diagnostics.")
+        if config["ephemeralOsDisk"]:
+            print("DEPLOYMENT_ACCEPTED: Gallery/evidence retained; ephemeral reference deleted; attestation "
+                  + ("NOT_VERIFIED" if ssh_validation else "NOT_RUN") + "; evidence=" + str(run))
+        else:
+            attestation = "NOT_VERIFIED" if ssh_validation else "NOT_RUN; collect over authenticated SSH after start"
+            print("DEPLOYMENT_ACCEPTED: Gallery retained; reference deallocated; attestation " + attestation + "; evidence=" + str(run))
+            print("SSH_HANDOFF: VM=" + config["resourceGroup"] + "/" + config["referenceVm"]
+                  + "; confirm or reconfigure approved network access before user-driven SSH/SDK testing."
+                  + " Start the VM when needed and authenticate its current host key through Azure diagnostics.")
     else:
         run = validate_run_path(args.run_directory, must_be_new=False)
         config = read_json(run / "config.json")
@@ -1294,7 +1412,9 @@ def main(argv=None):
         except BaseException as error:
             engine.failure(error)
             raise
-        print("RUN_REMOVED_LOCAL_EVIDENCE_RETAINED" if args.remove_run else "TEMPORARY_RESOURCES_REMOVED_REFERENCE_DEALLOCATED")
+        print("RUN_REMOVED_LOCAL_EVIDENCE_RETAINED" if args.remove_run else
+              "TEMPORARY_RESOURCES_REMOVED_EPHEMERAL_REFERENCE_DELETED" if config.get("ephemeralOsDisk", False)
+              else "TEMPORARY_RESOURCES_REMOVED_REFERENCE_DEALLOCATED")
     return 0
 
 

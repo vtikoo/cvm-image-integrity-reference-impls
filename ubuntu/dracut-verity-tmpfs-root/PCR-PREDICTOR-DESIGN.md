@@ -4,20 +4,29 @@
 
 ## Status and purpose
 
-[predict-pcrs.py](scripts/predict-pcrs.py) calculates expected SHA-256 PCR4,
-PCR7 and PCR11 values and emits expected PCR12/13 values for a
+[predict-pcrs.py](scripts/predict-pcrs.py) calculates expected SHA-256 PCR4
+and PCR11 values, optionally PCR7, and emits expected PCR12/13 values for a
 **no-external-inputs policy**, without booting the candidate image or reading
-its event log. It combines final build artifacts with an independently approved
-firmware baseline and an explicit boot-phase path. It neither changes the
+its event log. It combines final build artifacts with an explicit boot-phase
+path and, for PCR7, an independently approved firmware baseline. It neither changes the
 image nor contacts Azure, a TPM or Microsoft Azure Attestation (MAA).
 
-The implemented profile, `azure-direct-uki-v1`, models direct firmware launch
-of one signed x64 systemd-stub 255 UKI. Artifact-based PCR4/7/11 predictions matched
+Both profiles model direct firmware launch of one signed x64 systemd-stub 255
+UKI:
+
+| Selection | Boot profile | PCR7 / firmware baseline |
+| --- | --- | --- |
+| Default: Secure Boot enabled | `azure-direct-uki-v1` | Predict PCR7 from an independently approved, pinned baseline and one appended signer. |
+| `--disable-secure-boot` | `azure-direct-uki-no-secureboot-v1` | Omit PCR7 and reject baseline inputs; no base `db` is needed for this image policy. |
+
+Artifact-based PCR4/7/11 predictions for the enabled profile matched
 retained MAA-signed values for the tested reference. **Obtaining an independently
 approved base Secure Boot database remains unresolved.** The qualification
 baseline came from a separate controlled reference, not a published or approved
 Microsoft factory baseline. Matching those observations validates the model;
-it does not establish production trust in that baseline.
+it does not establish production trust in that baseline. The disabled profile
+reuses the PCR4/11 model; its deployed measurement sequence and end-to-end remote
+verification remain unqualified. A successful boot is not attestation approval.
 
 The current baseline and boot profile describe a **specific observed Azure
 implementation**, not a stable Azure API contract or a universal Azure default.
@@ -47,15 +56,19 @@ Independently retained build             Independently controlled policy
                    compares authenticated, fresh evidence
 ```
 
+The firmware baseline and enrollment GUID apply only to the enabled profile.
+Both profiles require independent UKI approval and an explicit phase path.
+
 | Input | Meaning and trust requirement |
 | --- | --- |
 | `--uki` | Final signed UKI from the approved build. A guest-retrieved copy must first match independently retained build hashes. |
-| `--signer-der` | Exactly one canonical DER certificate. OpenSSL checks its encoding and `sbverify` verifies the UKI against it; this does not prove firmware enrollment or revocation-policy acceptance. No private key is needed. |
-| `--firmware-baseline` | Schema-version-1 JSON containing `bootProfile`, `signatureOwnerGuid`, `variables` and nonempty `provenance`. Variables are base64-encoded complete values for `SecureBoot`, `PK`, `KEK`, `db` and `dbx`. |
-| `--firmware-baseline-sha256` | Lowercase SHA-256 of the exact JSON file bytes, obtained from independently approved policy. Reformatting the file changes the pin. Hashing an untrusted file at invocation time does not approve it. |
+| `--signer-der` | Required in both modes: exactly one canonical DER certificate. OpenSSL checks its encoding and `sbverify` verifies the UKI against it. This is artifact consistency, not independent policy approval, firmware enrollment or revocation-policy acceptance; disabled mode does not require enrollment. No private key is needed. |
+| `--disable-secure-boot` | Select the image-only profile without PCR7 evaluation. It does not configure a VM, authenticate Secure Boot state or prove that Secure Boot is disabled. |
+| `--firmware-baseline` | Enabled mode only, required with its pin: schema-version-1 JSON containing `bootProfile`, `signatureOwnerGuid`, `variables` and nonempty `provenance`. Variables are base64-encoded complete values for `SecureBoot`, `PK`, `KEK`, `db` and `dbx`. Rejected in disabled mode. |
+| `--firmware-baseline-sha256` | Enabled mode only: lowercase SHA-256 of the exact JSON file bytes, obtained from independently approved policy. Reformatting the file changes the pin. Hashing an untrusted file at invocation time does not approve it. |
 | `--phase-path` | Explicit colon-separated ordered PCR11 extensions. `sysinit:ready` matched the retained reference; an empty string requests UKI-only, not boot-complete state. |
 
-`signatureOwnerGuid` describes the **new signer enrollment**, while `variables`
+For the enabled profile, `signatureOwnerGuid` describes the **new signer enrollment**, while `variables`
 describe the baseline **before that signer is appended**. The baseline `db`
 must not already contain the supplied certificate. `SecureBoot` must be the
 single byte `01`; all other variables must be nonempty EFI signature-list
@@ -64,25 +77,33 @@ signature headers. It checks structure, not the trustworthiness of every
 baseline certificate. It rejects duplicate/unexpected JSON fields, unsupported
 profiles and a baseline file larger than 256 KiB.
 
-The output includes final `pcrs` with string keys `"4"`, `"7"`, `"11"`, `"12"`
-and `"13"`, ordered event digests and intermediate PCR values, cumulative
-`pcr11Checkpoints`, model identifiers and the SHA-256 hashes of all three input
-files. No prediction JSON is emitted on handled input/signature/dependency
-failure; the CLI exits with status 2. Output is not signed or approved by the
-tool: the relying party must protect, review and version it as expected policy.
+The output includes final `pcrs` with string keys `"4"`, `"11"`, `"12"` and
+`"13"`, plus `"7"` only in enabled mode, ordered event digests and intermediate PCR values, cumulative
+`pcr11Checkpoints`, model identifiers and the SHA-256 hashes of the provided
+input files (no baseline hash in disabled mode). `pcr7Policy` is `firmware-baseline`
+or `not-evaluated`. Disabled mode omits PCR7 from both `pcrs` and `events`:
+it does **not** predict zero, approve arbitrary PCR7 values on behalf of another
+policy, or assert an authenticated Secure Boot state. No prediction JSON is
+emitted on handled input/signature/dependency failure; the CLI exits with
+status 2. Output is not signed or approved by the tool: the relying party must
+protect, review and version it as expected policy.
 
 `externalInputPolicy` is `no-external-inputs`: PCR12 and PCR13 are each 32 zero
 bytes (64 hexadecimal zeroes), with empty event lists. These expectations assume
-no external addons, credentials or system extensions, and no other producer
-extends either PCR. They are policy references, not values derived from the UKI
-or proof that companion inputs are disabled. Nonempty external-input sequences
-are not modeled; the deployed empty-input sequence still needs qualification.
+no external command-line overrides, addons, credentials or system extensions,
+and no other producer extends either PCR. They are policy references, not values
+derived from the UKI or proof that companion inputs are disabled. Nonempty
+external-input sequences are not modeled; the deployed empty-input sequence
+still needs qualification.
 
 ## PCR selection: what the image policy needs to establish
 
-For this direct-UKI design, **PCR4 establishes the approved UKI identity** and
-**PCR7 establishes the approved Secure Boot policy**. External boot inputs must
-be constrained through PCR12 or qualified input disablement. **PCR11 value
+For this direct-UKI design, **PCR4 establishes the approved UKI identity**.
+The enabled profile additionally uses **PCR7 to establish the approved Secure
+Boot policy**; this is not an inherent requirement for exact-image approval
+when firmware signature enforcement is outside the relying party's policy.
+External boot inputs must be constrained through PCR12/13 or qualified input
+disablement. **PCR11 value
 verification is optional when the independently approved expected PCR4 is
 enforced**; it supports additional component-level or boot-phase policies.
 These checks assume an approved platform foundation, the characterized boot
@@ -92,6 +113,39 @@ zero-valued PCR12/13 expectations for the no-external-inputs policy;
 the PCR12/13 signed-coverage gaps remain open.** The current systemd-stub 255
 also supports PCR13-measured initrd system extensions; their exclusion or
 approval remains an additional condition.
+
+### Secure Boot disabled: measured approval, not execution prevention
+
+Approved firmware still measures the UKI into PCR4 before executing it.
+An independently approved PCR4 can therefore identify that UKI without its
+certificate being in firmware `db`. PCR11 alone cannot replace this check:
+it does not measure the stub code that performs its extensions.
+
+The disabled profile intentionally does not use PK/KEK/db/dbx or PCR7 as image
+approval inputs. If a separate policy requires a particular Secure Boot state,
+it still needs authenticated evidence of that state; selecting this calculator
+mode or trusting a deployment/guest JSON field does not provide it. The
+deployment controller's `--disable-secure-boot` is a separate, explicit opt-in:
+it requests and locally checks Secure Boot off while keeping vTPM enabled.
+
+With Secure Boot off, systemd-stub 255 accepts ordinary EFI command-line
+overrides and measures them into PCR12. The approved UKI's embedded `.cmdline`
+is still measured into PCR11, so matching PCR4/11 alone does not establish the
+effective command line or enforced verity root. Addons also lose Secure Boot
+signature enforcement, and companion credentials/extensions remain relevant.
+For this stock stub, the no-external-inputs policy requires authenticated zero
+PCR12 **and** PCR13 after qualifying the empty-input sequence and measurement
+behavior. Zero values demonstrate no extensions under that trusted model,
+not that the input paths were disabled. Alternatively, independently approve
+an implementation that disables or constrains all relevant inputs regardless
+of Secure Boot state.
+
+The approved hardware/firmware/vTPM foundation, external-driver qualification,
+freshness and binding key release to the receiving guest remain mandatory.
+Unapproved code may execute with Secure Boot off: withhold secrets until remote
+verification succeeds. Neither profile attests the mutable tmpfs upper or
+general runtime integrity. The tested MAA tokens omit PCR12/13, so neither the
+new predictor mode nor basic guest acceptance completes this verification path.
 
 ### Start with the hardware-bound measurement foundation
 
@@ -115,7 +169,7 @@ is not a substitute for checking the complete measured Secure Boot policy.
 | PCR | Image-approval rationale |
 | --- | --- |
 | **4: UEFI-measured bootloader/UKI** | UEFI measures EFI bootloaders/applications into PCR4 before transferring control to them. In this direct-UKI design, UEFI measures the UKI itself, whose Authenticode digest covers the systemd-stub code, kernel, initrd and embedded command line, including the dm-verity root hash and enforcement options. Matching an independently approved expected PCR4 value confirms the approved UKI and measured boot sequence, rather than merely confirming that approved UEFI firmware ran. An additional measured bootloader or boot attempt changes PCR4, even if Secure Boot accepts the image. |
-| **7: Secure Boot policy** | Establishes the measured `SecureBoot`, PK, KEK, `db`, `dbx` and used authority against an approved baseline. An enrolled customer certificate or a successful signature check alone does not establish the rest of the trust store. Appending a customer signer retains the template's other signers; a signer can authorize many images, so PCR7 does not replace exact-image approval. References must account for provisioning generation and persisted variable state. |
+| **7: Secure Boot policy (enabled profile only)** | Establishes the measured `SecureBoot`, PK, KEK, `db`, `dbx` and used authority against an approved baseline. An enrolled customer certificate or a successful signature check alone does not establish the rest of the trust store. Appending a customer signer retains the template's other signers; a signer can authorize many images, so PCR7 does not replace exact-image approval. References must account for provisioning generation and persisted variable state. Omitted from the disabled profile, not assumed zero. |
 | **11: optional component and boot-phase checks** | Checking the expected PCR11 value is optional when the independently approved expected PCR4 is enforced: PCR4 already covers the kernel, initrd and embedded command line. PCR11 provides separate payload-section measurements and later boot-phase extensions. A validated event log exposes individual component digests, including the `.cmdline` digest that binds the embedded verity root hash and enforcement options. A selected boot-phase checkpoint can be used with systemd service dependencies to require successful attestation before releasing secrets to be sealed to the PCR11 value for that phase. PCR11 does not cover the stub code itself. |
 | **12: external boot inputs** | With Secure Boot enabled and an embedded `.cmdline`, systemd-stub 255 ignores ordinary EFI invocation arguments, but still accepts valid signed `.addon.efi` files from the ESP, appends their parameters to the embedded command line and measures those additions into PCR12. A host able to modify the ESP can select or reorder already-signed addons accepted by Secure Boot without modifying the UKI itself. Signature validity does not approve their use or effective parameters for this image; whether appended options override embedded ones depends on the option's parser. PCR12 also covers accepted DeviceTree addons and companion credential archives. Verify an independently approved external-input sequence, or establish that the approved implementation disables or independently constrains those inputs. |
 | **13: external system-extension images** | The retained qualified UKI uses stock Ubuntu **systemd-stub `255.4-1ubuntu8.18`**, which collects companion `.raw` system-extension images, packages them into an additional initrd and measures the archive into PCR13. This pickup path is not disabled for confidential VMs. Extensions can supply software outside the verity lower if consumed; collection alone does not prove activation. Approve the extension inputs using PCR13 or establish that this path is disabled or cannot affect the approved boot/root behavior. Neither input approval nor non-consumption is established here. New builds install a wrapper that requests PCR13; a [tmpfs diagnostic requesting it](VALIDATION.md#pcr13-inclusive-tmpfs-diagnostic-2026-11-16) received no signed PCR13 coverage or value from MAA. |
@@ -132,7 +186,8 @@ still apply.
 
 With Secure Boot enabled and an embedded `.cmdline`, systemd-stub 255 ignores
 ordinary EFI command-line overrides, but still supports companion addons and
-credentials. Secure Boot approval of an addon is not approval of its use, order
+credentials. With Secure Boot disabled, accepted ordinary overrides also belong
+to PCR12. Secure Boot approval of an addon is not approval of its use, order
 or effective parameters for this image. A no-external-input policy should
 require an authenticated PCR12 value matching the qualified empty-input
 sequence: normally the initial all-zero SHA-256 value if no producer extends
@@ -237,7 +292,8 @@ describes build-time PCR4/11 calculations. Its [PCR section][azurestack-pcrs]
 masks phase services to stabilize PCR11; this recipe instead retains explicit,
 qualified phase paths. That README does not supply a complete PCR7/12 policy
 or justify omitting external-input checks. Its SquashFS/selective-tmpfs layout
-also differs from this recipe's ext4 lower/whole-root writable overlay, so its
+also differs from this recipe's whole-root writable overlay (ext4 lower by
+default, optionally SquashFS), so its
 runtime-integrity claims cannot be imported unchanged.
 
 [azure-attestation-design]: https://learn.microsoft.com/en-us/azure/confidential-computing/guest-attestation-confidential-virtual-machines-design
@@ -265,7 +321,8 @@ relying on an exclusion.
 
 ## Measurement model
 
-All five PCRs start at 32 zero bytes for the modeled boot. PCR12/13 remain
+All modeled PCRs start at 32 zero bytes for the modeled boot. Disabled mode
+does not model PCR7. PCR12/13 remain
 unchanged under the no-external-inputs policy. Each modeled event extends:
 
 ```text
@@ -301,6 +358,9 @@ launch in this sequence. A different boot path needs a new qualified model;
 the predictor cannot detect the target's actual boot path from a UKI alone.
 
 ### PCR7: Secure Boot variables and authorizing certificate
+
+This section applies only to `azure-direct-uki-v1`. The disabled profile emits
+no PCR7 prediction or event list and requires no firmware variable baseline.
 
 Let `C` be the exact signer DER bytes and `O` the enrollment owner GUID in
 UEFI little-endian byte representation. The predictor constructs one new

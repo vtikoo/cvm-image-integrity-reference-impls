@@ -67,6 +67,7 @@ class Fixture(unittest.TestCase):
     def acceptance(self, reboot=False):
         return {
             "result": "GUEST_ACCEPTANCE_PASSED", "rootHash": self.build["rootHash"],
+            "secureBootEnabled": self.config["secureBootEnabled"],
             "attestationSdk": self.build["attestationSdk"],
             "bootId": self.boot2 if reboot else self.boot1,
             "cloudInit": {"status": "done", "errors": [], "recoverable_errors": {}},
@@ -126,6 +127,8 @@ class PlanningTests(Fixture):
         write.assert_not_called()
         config = json.loads(output.getvalue())
         self.assertEqual(config["vmSize"], "Standard_DC4es_v6")
+        self.assertTrue(config["secureBootEnabled"])
+        self.assertFalse(config["ephemeralOsDisk"])
         self.assertEqual(config["builderImage"], "Canonical:ubuntu-24_04-lts:server:24.04.202610250")
         self.assertEqual(config["sourceImage"], "Canonical:ubuntu-24_04-lts:cvm:24.04.202610280")
         self.assertFalse(Path(config["runDirectory"]).exists())
@@ -138,6 +141,16 @@ class PlanningTests(Fixture):
         self.arguments[self.arguments.index("--run-directory") + 1] = str(new)
         with self.assertRaisesRegex(deploy.DeploymentError, "outside"):
             deploy.configuration(deploy.parser().parse_args(self.arguments + ["--plan"]))
+
+    def test_squashfs_selection_is_explicit_and_plan_preserves_it(self):
+        args = self.arguments[:]
+        args[args.index("--run-directory") + 1] = str(self.workspace / "squashfs-plan")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(deploy.main(args + ["--root-filesystem", "squashfs", "--plan"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["rootFilesystem"], "squashfs")
+        self.assertEqual(self.config["rootFilesystem"], "ext4")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            deploy.parser().parse_args(args + ["--root-filesystem", "xfs"])
 
     def test_rejects_public_ssh_wrong_tee_unpinned_builder_and_bad_endpoint(self):
         for option, value in (
@@ -290,7 +303,8 @@ class AzureBoundaryTests(Fixture):
                     builder = size == self.config["builderVmSize"]
                     return [{"name": size, "family": "builder-family" if builder else "reference-family",
                              "restrictions": [], "capabilities": [
-                                 {"name": "vCPUs", "value": "8" if builder else "4"}]}]
+                                 {"name": "vCPUs", "value": "8" if builder else "4"},
+                                 {"name": "ConfidentialComputingType", "value": "TDX"}]}]
                 self.fail("Unexpected Azure call")
             with self.subTest(limit=limit, current=current), patch.object(
                     self.engine, "az", side_effect=azure):
@@ -351,7 +365,8 @@ class AzureBoundaryTests(Fixture):
                 if args[:2] == ("vm", "list-skus"):
                     return [{"name": args[args.index("--size") + 1], "family": "family",
                              "restrictions": [{"type": kind, "reasonCode": "NotAvailableForSubscription"}],
-                             "capabilities": [{"name": "vCPUs", "value": "8"}]}]
+                             "capabilities": [{"name": "vCPUs", "value": "8"},
+                                              {"name": "ConfidentialComputingType", "value": "TDX"}]}]
                 self.fail("Unexpected Azure call")
             with self.subTest(kind=kind), patch.object(self.engine, "az", side_effect=azure):
                 if accepted:
@@ -396,6 +411,15 @@ class AzureBoundaryTests(Fixture):
                 "diskSizeGb": 64, "managedDisk": {"securityProfile": {"securityEncryptionType": "VMGuestStateOnly"}}}},
         })
         self.engine.check_reference_model(model)
+        for enabled in (False, True):
+            self.config["secureBootEnabled"] = enabled
+            model["securityProfile"]["uefiSettings"]["secureBootEnabled"] = enabled
+            self.engine.check_reference_model(model)
+            for field in ("secureBootEnabled", "vTpmEnabled"):
+                changed = copy.deepcopy(model)
+                changed["securityProfile"]["uefiSettings"][field] = not model["securityProfile"]["uefiSettings"][field]
+                with self.subTest(enabled=enabled, field=field), self.assertRaises(deploy.DeploymentError):
+                    self.engine.check_reference_model(changed)
         for target, key, value in (
             ("securityProfile", "securityType", "TrustedLaunch"),
             ("hardwareProfile", "vmSize", "Standard_DC4as_v6"),
@@ -437,19 +461,25 @@ class AzureBoundaryTests(Fixture):
         model.update({"diagnosticsProfile": {"bootDiagnostics": {"enabled": True}},
                       "hardwareProfile": {"vmSize": self.config["vmSize"]},
                       "storageProfile": {"osDisk": {"managedDisk": {"id": "owned-disk-id"}}}})
-        with patch.object(self.engine, "owned_group"), patch.object(self.engine, "az", side_effect=[[], nic, {}]), \
-                patch.object(self.engine, "rest") as rest, patch.object(self.engine, "poll"), \
-                patch.object(self.engine, "vm", return_value=model), patch.object(self.engine, "check_reference_model"):
-            self.engine.new_vm("reference", deploy.version_id(self.config))
-        body = rest.call_args.args[2]
-        props = body["properties"]
-        self.assertTrue(props["diagnosticsProfile"]["bootDiagnostics"]["enabled"])
-        self.assertEqual(props["securityProfile"]["securityType"], "ConfidentialVM")
-        self.assertEqual(props["securityProfile"]["uefiSettings"], {"secureBootEnabled": True, "vTpmEnabled": True})
-        disk = props["storageProfile"]["osDisk"]
-        self.assertEqual(disk["diskSizeGB"], 64)
-        self.assertEqual(disk["managedDisk"]["securityProfile"]["securityEncryptionType"], "VMGuestStateOnly")
-        self.assertNotIn("publicIPAddress", json.dumps(body))
+        for role, enabled in (("reference", True), ("reference", False), ("builder", False)):
+            self.config["secureBootEnabled"] = enabled
+            model["hardwareProfile"]["vmSize"] = self.config["builderVmSize"] if role == "builder" else self.config["vmSize"]
+            with self.subTest(role=role, enabled=enabled), patch.object(self.engine, "owned_group"), \
+                    patch.object(self.engine, "az", side_effect=[[], nic, {}]), \
+                    patch.object(self.engine, "rest") as rest, patch.object(self.engine, "poll"), \
+                    patch.object(self.engine, "vm", return_value=model), patch.object(self.engine, "check_reference_model"):
+                self.engine.new_vm(role, deploy.version_id(self.config))
+            body = rest.call_args.args[2]
+            props = body["properties"]
+            self.assertTrue(props["diagnosticsProfile"]["bootDiagnostics"]["enabled"])
+            self.assertEqual(props["securityProfile"]["securityType"], "TrustedLaunch" if role == "builder" else "ConfidentialVM")
+            self.assertEqual(props["securityProfile"]["uefiSettings"], {
+                "secureBootEnabled": True if role == "builder" else enabled, "vTpmEnabled": True})
+            disk = props["storageProfile"]["osDisk"]
+            self.assertEqual(disk["diskSizeGB"], 256 if role == "builder" else 64)
+            if role == "reference":
+                self.assertEqual(disk["managedDisk"]["securityProfile"]["securityEncryptionType"], "VMGuestStateOnly")
+            self.assertNotIn("publicIPAddress", json.dumps(body))
 
     def test_failure_requests_deallocation_only_for_proven_owned_vms(self):
         self.engine.group_created = True
@@ -463,6 +493,209 @@ class AzureBoundaryTests(Fixture):
         deallocate.assert_called_once_with("builder", wait=False)
         self.assertEqual(deploy.read_json(self.engine.evidence / "failure.json")["result"], "DEPLOYMENT_FAILED")
         self.assertTrue((self.engine.evidence / "reference-failure-deallocation.json").exists())
+
+
+class EphemeralReferenceTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.config.update(vmSize="Standard_DC4eds_v6", ephemeralOsDisk=True)
+
+    def reference_model(self):
+        model = self.model()
+        model.update({
+            "securityProfile": {"securityType": "ConfidentialVM",
+                                "uefiSettings": {"secureBootEnabled": True, "vTpmEnabled": True}},
+            "hardwareProfile": {"vmSize": self.config["vmSize"]},
+            "diagnosticsProfile": {"bootDiagnostics": {"enabled": True}},
+            "storageProfile": {"imageReference": {"id": deploy.version_id(self.config)}, "osDisk": {
+                "diskSizeGb": 64, "caching": "ReadOnly",
+                "diffDiskSettings": {"option": "Local", "placement": "NvmeDisk"},
+                "managedDisk": {
+                    "id": deploy.base_id(self.config) + "/providers/Microsoft.Compute/disks/"
+                          + self.config["referenceVm"] + "-os",
+                    "securityProfile": {"securityEncryptionType": "VMGuestStateOnly"}}}},
+        })
+        return model
+
+    def test_planning_exposes_independent_secure_boot_and_os_disk_choices(self):
+        for ephemeral in (False, True):
+            for enabled in (True, False):
+                arguments = self.arguments + [
+                    "--run-directory", str(self.workspace / "plan"),
+                    "--vm-size", "Standard_DC4eds_v6",
+                ] + (["--ephemeral-os-disk"] if ephemeral else []) + (
+                    [] if enabled else ["--disable-secure-boot"])
+                config = deploy.configuration(deploy.parser().parse_args(arguments))
+                self.assertEqual(config["vmSize"], "Standard_DC4eds_v6")
+                self.assertIs(config["secureBootEnabled"], enabled)
+                self.assertEqual(config["ephemeralOsDisk"], ephemeral)
+        with self.assertRaises(deploy.DeploymentError):
+            deploy.configuration(deploy.parser().parse_args(arguments + ["--vm-size", "Standard_DC4"]))
+
+    def test_preflight_requires_tdx_and_nvme_ephemeral_capacity(self):
+        valid = {"vCPUs": "4", "ConfidentialComputingType": "TDX", "EphemeralOSDiskSupported": "True",
+                 "SupportedEphemeralOSDiskPlacements": "NvmeDisk", "NvmeDiskSizeInMiB": "225280"}
+        for changes, accepted in (
+            ({}, True), ({"ConfidentialComputingType": "SNP"}, False),
+            ({"ConfidentialComputingType": None}, False), ({"EphemeralOSDiskSupported": "False"}, False),
+            ({"SupportedEphemeralOSDiskPlacements": "CacheDisk"}, False),
+            ({"NvmeDiskSizeInMiB": "32768"}, False),
+        ):
+            capabilities = dict(valid, **changes)
+            def azure(*args):
+                if args[:2] == ("group", "exists"):
+                    return False
+                if args[:2] == ("vm", "image"):
+                    return {}
+                if args[:2] == ("vm", "list-usage"):
+                    return [{"name": {"value": family}, "limit": 64, "currentValue": 0}
+                            for family in ("cores", "family")]
+                if args[:2] == ("vm", "list-skus"):
+                    return [{"name": args[args.index("--size") + 1], "family": "family", "restrictions": [],
+                             "capabilities": [{"name": key, "value": value}
+                                              for key, value in capabilities.items() if value is not None]}]
+                self.fail("Unexpected preflight call")
+            with self.subTest(changes=changes), patch.object(self.engine, "az", side_effect=azure):
+                if accepted:
+                    self.engine.preflight()
+                else:
+                    with self.assertRaises(deploy.DeploymentError):
+                        self.engine.preflight()
+
+    def test_vm_creation_requests_selected_modes_without_tagging_nonexistent_disk(self):
+        key = self.workspace / "public"
+        key.write_text("ssh-ed25519 fixture")
+        self.config["sshPublicKey"] = str(key)
+        nic = {"NewNIC": {"id": self.model()["id"] + "-nic"}}
+        with patch.object(self.engine, "owned_group"), \
+                patch.object(self.engine, "az", side_effect=[[], nic]) as azure, \
+                patch.object(self.engine, "rest") as rest, patch.object(self.engine, "poll"), \
+                patch.object(self.engine, "vm", return_value=self.reference_model()):
+            self.engine.new_vm("reference", deploy.version_id(self.config))
+        disk = rest.call_args.args[2]["properties"]["storageProfile"]["osDisk"]
+        self.assertEqual(disk["diffDiskSettings"], {"option": "Local", "placement": "NvmeDisk"})
+        self.assertEqual(disk["managedDisk"]["securityProfile"]["securityEncryptionType"], "VMGuestStateOnly")
+        self.assertEqual(disk["caching"], "ReadOnly")
+        self.assertEqual(disk["deleteOption"], "Delete")
+        self.assertFalse(any(call.args[0] == "tag" for call in azure.call_args_list))
+
+    def test_model_readback_rejects_persistence_fallbacks_without_disk_lookup(self):
+        with patch.object(self.engine, "az", side_effect=AssertionError("Nonexistent managed disk lookup")):
+            self.engine.check_reference_model(self.reference_model())
+            without_logical_id = self.reference_model()
+            del without_logical_id["storageProfile"]["osDisk"]["managedDisk"]["id"]
+            self.engine.check_reference_model(without_logical_id)
+            for field, value in (
+                ("diffDiskSettings", {}), ("diffDiskSettings", {"option": "Local", "placement": "CacheDisk"}),
+                ("diskSizeGb", None), ("caching", "ReadWrite"),
+                ("managedDisk", {"securityProfile": {"securityEncryptionType": "unexpected"}}),
+                ("managedDisk", {"id": "/unexpected/disk",
+                                 "securityProfile": {"securityEncryptionType": "VMGuestStateOnly"}}),
+            ):
+                model = self.reference_model()
+                model["storageProfile"]["osDisk"][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(deploy.DeploymentError):
+                    self.engine.check_reference_model(model)
+            self.config["ephemeralOsDisk"] = False
+            with self.assertRaises(deploy.DeploymentError):
+                self.engine.check_reference_model(self.reference_model())
+
+    def test_owned_deletion_preserves_diagnostics_and_requires_confirmation(self):
+        for remains in (False, True):
+            with self.subTest(remains=remains), patch.object(self.engine, "owned_group"), \
+                    patch.object(self.engine, "vm", return_value=self.reference_model()), \
+                    patch.object(self.engine, "az", side_effect=[
+                        "serial evidence", None, [self.model()] if remains else []]) as azure:
+                if remains:
+                    with self.assertRaisesRegex(deploy.DeploymentError, "remains after deletion"):
+                        self.engine.delete_ephemeral_reference()
+                else:
+                    self.engine.delete_ephemeral_reference()
+            self.assertEqual(azure.call_args_list[0].args[:3], ("vm", "boot-diagnostics", "get-boot-log"))
+            self.assertEqual(azure.call_args_list[1].args[:2], ("vm", "delete"))
+            self.assertEqual(deploy.read_json(self.engine.evidence / "reference-final-boot-log.json"),
+                             {"log": "serial evidence"})
+        with patch.object(self.engine, "owned_group", side_effect=deploy.DeploymentError("not owned")), \
+                patch.object(self.engine, "az") as azure, self.assertRaises(deploy.DeploymentError):
+            self.engine.delete_ephemeral_reference()
+        azure.assert_not_called()
+
+    def test_diagnostics_error_is_reported_but_does_not_leave_ephemeral_vm_running(self):
+        with patch.object(self.engine, "owned_group"), \
+                patch.object(self.engine, "vm", return_value=self.reference_model()), \
+                patch.object(self.engine, "az", side_effect=[
+                    deploy.DeploymentError("unavailable"), None, []]) as azure, \
+                contextlib.redirect_stderr(io.StringIO()) as errors:
+            self.engine.delete_ephemeral_reference()
+        self.assertIn("boot log retrieval failed", errors.getvalue())
+        self.assertEqual(azure.call_args_list[1].args[:2], ("vm", "delete"))
+
+    def test_failure_deletes_only_owned_ephemeral_reference_and_never_deallocates_it(self):
+        self.engine.group_created = True
+        for owned in (True, False):
+            model = self.model() if owned else dict(self.model(), tags={})
+            with self.subTest(owned=owned), patch.object(self.engine, "owned_group"), \
+                    patch.object(self.engine, "az", return_value=[model]), \
+                    patch.object(self.engine, "delete_ephemeral_reference") as delete, \
+                    patch.object(self.engine, "deallocate", side_effect=AssertionError("Cannot deallocate")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.engine.failure(deploy.DeploymentError("test"))
+            self.assertEqual(delete.call_count, int(owned))
+        with patch.object(self.engine, "az") as azure, self.assertRaisesRegex(
+                deploy.DeploymentError, "cannot be deallocated"):
+            self.engine.deallocate("reference")
+        azure.assert_not_called()
+
+    def test_successful_ephemeral_cleanup_is_repeatable_and_does_not_offer_ssh_handoff(self):
+        deploy.write_json(self.engine.evidence / "reference-model.json", self.reference_model())
+        deploy.write_json(self.engine.evidence / "builder-model.json", self.model("builder"))
+        for exists in (True, False):
+            inventory = [self.model()] if exists else []
+            def azure(*args):
+                if args[:2] == ("vm", "list"):
+                    return inventory
+                if args[:2] == ("resource", "list"):
+                    return []
+                self.fail("Unexpected cleanup action: " + repr(args[:3]))
+            def delete():
+                inventory.clear()
+            with self.subTest(exists=exists), patch.object(self.engine, "owned_group"), \
+                    patch.object(self.engine, "acceptance_gate"), \
+                    patch.object(self.engine, "vm", return_value=self.reference_model()), \
+                    patch.object(self.engine, "delete_ephemeral_reference", side_effect=delete) as deletion, \
+                    patch.object(self.engine, "deallocate", side_effect=AssertionError("Cannot deallocate")), \
+                    patch.object(self.engine, "az", side_effect=azure):
+                self.engine.cleanup()
+            self.assertEqual(deletion.call_count, int(exists))
+            summary = deploy.read_json(self.engine.evidence / "cleanup-summary.json")
+            self.assertFalse(summary["referenceDeallocated"])
+            self.assertTrue(summary["referenceDeleted"])
+            self.assertEqual(summary["sshAccess"], "NO_VM_RETAINED")
+
+    def test_managed_ephemeral_acceptance_does_not_defer_attestation_to_a_deleted_vm(self):
+        self.config["validationTransport"] = "managed"
+        deploy.write_json(self.engine.evidence / "build.json", self.build)
+        deploy.private_write(self.engine.evidence / "signer.der", b"public fixture")
+        def retrieve(role, remote, local):
+            content = json.dumps(self.acceptance(Path(local).name == "acceptance-reboot.json")).encode()
+            deploy.private_write(local, content)
+            return content
+        with patch.object(self.engine, "managed"), patch.object(self.engine, "retrieve", side_effect=retrieve), \
+                patch.object(self.engine, "remove_reference_commands"), patch.object(self.engine, "az"):
+            self.engine.acceptance(self.build)
+        summary = deploy.read_json(self.engine.evidence / "acceptance-complete.json")
+        self.assertEqual(summary["attestationCollection"], "NOT_RUN")
+        self.assertIn("deleted", summary["attestationVerification"])
+        with patch.object(deploy, "public_profile", return_value={}), \
+                patch.object(deploy, "validate_gallery"), patch.object(self.engine, "rest", return_value={}):
+            self.engine.acceptance_gate()
+            summary["attestationCollection"] = "DEFERRED_TO_SSH"
+            self.engine.record("acceptance-complete", summary)
+            self.engine.acceptance_gate()
+            summary["attestationCollection"] = "EVIDENCE_COLLECTED"
+            self.engine.record("acceptance-complete", summary)
+            with self.assertRaises(deploy.DeploymentError):
+                self.engine.acceptance_gate()
 
 
 class SSHTests(Fixture):
@@ -612,6 +845,13 @@ class ManagedAcceptanceTests(Fixture):
         self.assertFalse((self.engine.evidence / "rejected").exists())
 
     def test_managed_first_reboot_acceptance_never_uses_ssh_or_claims_sdk_collection(self):
+        self.check_managed_acceptance(secure_boot=True)
+
+    def test_disabled_secure_boot_is_forwarded_to_managed_acceptance_and_cleanup_gate(self):
+        self.check_managed_acceptance(secure_boot=False)
+
+    def check_managed_acceptance(self, *, secure_boot):
+        self.config["secureBootEnabled"] = secure_boot
         deploy.write_json(self.engine.evidence / "build.json", self.build)
         deploy.private_write(self.engine.evidence / "signer.der", b"public fixture")
         events = []
@@ -634,7 +874,11 @@ class ManagedAcceptanceTests(Fixture):
             self.engine.acceptance(self.build)
         self.assertEqual(events, ["cvm-reference-first", "remove", "restart", "cvm-reference-reboot", "remove"])
         self.assertIn("--previous-boot-id " + self.boot1, scripts[1])
+        for script in scripts:
+            invocation = next(line for line in script.splitlines() if line.startswith("python3 "))
+            self.assertEqual("--disable-secure-boot" in invocation, not secure_boot)
         summary = deploy.read_json(self.engine.evidence / "acceptance-complete.json")
+        self.assertIs(summary["secureBootEnabled"], secure_boot)
         self.assertEqual(summary["attestationCollection"], "DEFERRED_TO_SSH")
         self.assertEqual((summary["beforeBootId"], summary["afterBootId"]), (self.boot1, self.boot2))
         self.assertFalse((self.engine.evidence / "attestation").exists())
@@ -730,6 +974,13 @@ class EvidenceTests(Fixture):
         self.assertEqual({path.name for path in (self.engine.evidence / "attestation").iterdir()}, set(files))
 
     def test_complete_ssh_acceptance_reboots_challenges_and_retains_all_private_files(self):
+        self.check_ssh_acceptance(secure_boot=True)
+
+    def test_disabled_secure_boot_is_forwarded_to_ssh_acceptance(self):
+        self.check_ssh_acceptance(secure_boot=False)
+
+    def check_ssh_acceptance(self, *, secure_boot):
+        self.config["secureBootEnabled"] = secure_boot
         staged = {}
         files = self.attestation_files("aa" * 32)
         commands = []
@@ -743,6 +994,7 @@ class EvidenceTests(Fixture):
             elif remote.startswith("sudo sha256sum "):
                 output = (deploy.digest(staged[remote.split()[2]]) + "  staged\n").encode()
             elif remote.startswith("sudo python3 "):
+                self.assertEqual("--disable-secure-boot" in remote, not secure_boot)
                 output = json.dumps(self.acceptance("--previous-boot-id" in remote)).encode()
             elif remote.startswith("sudo find "):
                 output = ("\n".join(files) + "\n").encode()
@@ -769,6 +1021,7 @@ class EvidenceTests(Fixture):
         self.assertEqual(bootstrap.call_args_list[1].kwargs["previous"], self.boot1)
         summary = deploy.read_json(self.engine.evidence / "acceptance-complete.json")
         self.assertEqual(summary["result"], "ACCEPTANCE_COMPLETE")
+        self.assertIs(summary["secureBootEnabled"], secure_boot)
         self.assertEqual(summary["tokenMissingRequestedPcrs"], [12, 13])
         self.assertTrue(summary["attestationVerification"].startswith("NOT_VERIFIED"))
         for name in files:
@@ -811,6 +1064,17 @@ class EvidenceTests(Fixture):
                 deploy.validate_acceptance(dict(self.acceptance(), **change), self.build)
         with self.assertRaises(deploy.DeploymentError):
             deploy.validate_acceptance(dict(self.acceptance(True), bootId=self.boot1), self.build, self.boot1)
+
+    def test_acceptance_rejects_mismatched_or_missing_disabled_mode(self):
+        for enabled in (True, False):
+            value = dict(self.acceptance(), secureBootEnabled=enabled)
+            self.assertEqual(deploy.validate_acceptance(value, self.build, secure_boot=enabled), self.boot1)
+            with self.assertRaisesRegex(deploy.DeploymentError, "Secure Boot mode"):
+                deploy.validate_acceptance(value, self.build, secure_boot=not enabled)
+        value.pop("secureBootEnabled")
+        self.assertEqual(deploy.validate_acceptance(value, self.build), self.boot1)
+        with self.assertRaisesRegex(deploy.DeploymentError, "Secure Boot mode"):
+            deploy.validate_acceptance(value, self.build, secure_boot=False)
 
     def test_receipt_is_not_a_verification_and_pcr12_13_omissions_must_be_explicit(self):
         self.assertEqual(deploy.validate_receipt(self.receipt(), "aa" * 32, self.build), [12, 13])
@@ -911,6 +1175,30 @@ class EvidenceTests(Fixture):
             "buildJsonSha256": deploy.digest((self.engine.evidence / "build.json").read_bytes()),
         }
         self.engine.validate_build(build, provenance, manifest)
+        for filesystem in ("ext4", "squashfs"):
+            with self.subTest(filesystem=filesystem):
+                self.config["rootFilesystem"] = filesystem
+                selected_build = dict(build, rootFilesystem=filesystem)
+                selected_provenance = dict(provenance, rootFilesystem=filesystem)
+                deploy.write_json(self.engine.evidence / "build.json", selected_build, exclusive=False)
+                selected_provenance["buildJsonSha256"] = deploy.digest(
+                    (self.engine.evidence / "build.json").read_bytes())
+                self.engine.validate_build(selected_build, selected_provenance, manifest)
+                other = "ext4" if filesystem == "squashfs" else "squashfs"
+                for mismatch in (other, "xfs"):
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(dict(selected_build, rootFilesystem=mismatch),
+                                                   selected_provenance, manifest)
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(selected_build, dict(selected_provenance, rootFilesystem=mismatch),
+                                                   manifest)
+                if filesystem == "squashfs":
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(build, selected_provenance, manifest)
+                    with self.assertRaisesRegex(deploy.DeploymentError, "root filesystem"):
+                        self.engine.validate_build(selected_build, provenance, manifest)
+        self.config["rootFilesystem"] = "ext4"
+        deploy.write_json(self.engine.evidence / "build.json", build, exclusive=False)
         for change in (
             {"sourceMatchesOriginal": False}, {"sourceRawSha256": "ff" * 32}, {"kernel": "builder-host-kernel"},
             {"recipeFiles": {}}, {"outputs": dict(provenance["outputs"], **{"signer.der": "ff" * 32})},
@@ -921,6 +1209,24 @@ class EvidenceTests(Fixture):
         changed_build["attestationSdk"]["revision"] = "unapproved"
         with self.assertRaises(deploy.DeploymentError):
             self.engine.validate_build(changed_build, provenance, manifest)
+
+    def test_build_forwards_selected_filesystem_to_provision_and_build(self):
+        class StopBeforeRemoteBuild(Exception):
+            pass
+
+        for filesystem in ("ext4", "squashfs"):
+            self.config["rootFilesystem"] = filesystem
+            with self.subTest(filesystem=filesystem), \
+                    patch.object(deploy, "recipe_archive", return_value=(b"unit archive", {})), \
+                    patch.object(self.engine, "managed", side_effect=[None, StopBeforeRemoteBuild]) as managed, \
+                    patch.object(self.engine, "az", return_value={"id": "unit-source"}), \
+                    patch.object(self.engine, "owned"), patch.object(self.engine, "bootstrap"), \
+                    patch.object(self.engine, "vm", return_value={"id": "unit-builder"}), \
+                    patch.object(self.engine, "rest"), self.assertRaises(StopBeforeRemoteBuild):
+                self.engine.build()
+            provision, build = managed.call_args_list
+            self.assertTrue(provision.args[1].endswith(f"builder.sh provision {filesystem}\n"))
+            self.assertEqual(build.args[1], f"bash /var/lib/cvm-dracut/builder.sh build {filesystem}\n")
 
 
 class UploadTests(Fixture):
@@ -935,8 +1241,8 @@ class UploadTests(Fixture):
         return path
 
     def test_managed_identity_page_blob_upload_requires_full_independent_readback(self):
-        for corrupt in (False, True):
-            with self.subTest(corrupt=corrupt):
+        for corrupt, dns_failures in ((False, 0), (True, 0), (False, 1)):
+            with self.subTest(corrupt=corrupt, dns_failures=dns_failures):
                 path = self.vhd()
                 content = path.read_bytes()
                 remote = bytearray(len(content))
@@ -951,6 +1257,7 @@ class UploadTests(Fixture):
                     headers = properties
 
                 def open_request(request, timeout):
+                    nonlocal dns_failures
                     requests.append(request)
                     if request.full_url.startswith("http://169.254.169.254/"):
                         self.assertEqual(request.headers["Metadata"], "true")
@@ -961,14 +1268,21 @@ class UploadTests(Fixture):
                         span = request.headers["X-ms-range"].removeprefix("bytes=").split("-")
                         remote[int(span[0]):int(span[1]) + 1] = request.data
                     if request.get_method() == "GET":
+                        if dns_failures:
+                            dns_failures -= 1
+                            raise uploader.urllib.error.URLError(
+                                uploader.socket.gaierror(uploader.socket.EAI_AGAIN, "temporary DNS failure"))
                         span = request.headers["Range"].removeprefix("bytes=").split("-")
                         result = bytes(remote[int(span[0]):int(span[1]) + 1])
                         return Response((b"x" + result[1:]) if corrupt else result)
                     return Response(b"")
 
-                target = self.engine.evidence / ("upload-bad.json" if corrupt else "upload-good.json")
+                retry_expected = dns_failures
+                target = self.engine.evidence / (
+                    "upload-dns.json" if dns_failures else "upload-bad.json" if corrupt else "upload-good.json")
                 with patch.object(uploader.urllib.request, "build_opener", return_value=Mock(open=open_request)), \
-                        contextlib.redirect_stdout(io.StringIO()):
+                        patch.object(uploader.time, "sleep") as sleep, \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                     if corrupt:
                         with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
                             uploader.upload(path, "https://owned.blob.core.windows.net/images/dracut.vhd",
@@ -978,8 +1292,29 @@ class UploadTests(Fixture):
                         result = uploader.upload(path, "https://owned.blob.core.windows.net/images/dracut.vhd",
                                                  deploy.digest(content), self.build["rootHash"], target)
                         self.assertEqual(result["readbackSha256"], deploy.digest(content))
+                self.assertEqual(sleep.call_count, retry_expected)
                 self.assertTrue(any(request.get_method() == "GET" for request in requests))
                 self.assertFalse(any("sig=" in request.full_url for request in requests))
+
+    def test_dns_retries_are_bounded_and_permanent_resolution_errors_are_not_retried(self):
+        path = self.vhd()
+        identity = json.dumps({"access_token": "fake-unit-token", "expires_on": int(time.time()) + 3600}).encode()
+        for code, attempts, expected_error in (
+                (uploader.socket.EAI_AGAIN, 18, RuntimeError),
+                (uploader.socket.EAI_NONAME, 1, uploader.urllib.error.URLError)):
+            with self.subTest(code=code):
+                error = uploader.urllib.error.URLError(uploader.socket.gaierror(code, "DNS failure"))
+                opener = Mock()
+                opener.open.side_effect = [io.BytesIO(identity)] + [error] * attempts
+                target = self.engine.evidence / "no-dns-receipt.json"
+                with patch.object(uploader.urllib.request, "build_opener", return_value=opener), \
+                        patch.object(uploader.time, "sleep") as sleep, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(expected_error):
+                    uploader.upload(path, "https://owned.blob.core.windows.net/images/dracut.vhd",
+                                    deploy.digest(path.read_bytes()), self.build["rootHash"], target)
+                self.assertEqual(opener.open.call_count, attempts + 1)
+                self.assertEqual(sleep.call_count, attempts - 1)
+                self.assertFalse(target.exists())
 
     def test_changed_vhd_or_sas_is_rejected_before_network(self):
         path = self.vhd()

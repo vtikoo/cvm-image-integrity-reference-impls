@@ -8,15 +8,18 @@ import re
 import uuid
 
 
-def command_line(root_hash, data_uuid, hash_uuid):
+def command_line(root_hash, data_uuid, hash_uuid, root_filesystem="ext4"):
+    if root_filesystem not in ("ext4", "squashfs"):
+        raise ValueError("Root filesystem must be ext4 or squashfs")
     if not re.fullmatch(r"[0-9a-f]{64}", root_hash):
         raise ValueError("Expected a SHA-256 root hash")
     data_uuid, hash_uuid = str(uuid.UUID(data_uuid)), str(uuid.UUID(hash_uuid))
     if data_uuid == hash_uuid:
         raise ValueError("Data and hash partition identifiers must differ")
+    root_options = "ro,noload" if root_filesystem == "ext4" else "ro"
     return (
         "console=tty0 console=ttyS0,115200n8 "
-        "root=/dev/mapper/root rootfstype=ext4 ro rootflags=ro,noload "
+        f"root=/dev/mapper/root rootfstype={root_filesystem} ro rootflags={root_options} "
         f"roothash={root_hash} "
         f"systemd.verity_root_data=/dev/disk/by-partuuid/{data_uuid} "
         f"systemd.verity_root_hash=/dev/disk/by-partuuid/{hash_uuid} "
@@ -33,7 +36,9 @@ def write(root, name, content):
     path.write_text(content)
 
 
-def finalize(root, image_urn):
+def finalize(root, image_urn, root_filesystem="ext4"):
+    if root_filesystem not in ("ext4", "squashfs"):
+        raise ValueError("Root filesystem must be ext4 or squashfs")
     release = dict(
         line.split("=", 1) for line in (root / "etc/os-release").read_text().splitlines()
         if "=" in line
@@ -81,6 +86,7 @@ def finalize(root, image_urn):
         "imageUrn": image_urn,
         "bootIntegration": "dracut-systemd-signed-uki",
         "rootPolicy": "dm-verity lower; volatile tmpfs overlay",
+        "rootFilesystem": root_filesystem,
     }, indent=2) + "\n")
     # The EFI partition is deliberately not mounted after switch-root.
     write(root, "etc/systemd/system/cvm-root-policy.service",
@@ -126,10 +132,12 @@ def main():
     finalize_args = sub.add_parser("finalize")
     finalize_args.add_argument("root", type=Path)
     finalize_args.add_argument("image_urn")
+    finalize_args.add_argument("root_filesystem", nargs="?", choices=("ext4", "squashfs"), default="ext4")
     cmd = sub.add_parser("cmdline")
     cmd.add_argument("root_hash")
     cmd.add_argument("data_uuid")
     cmd.add_argument("hash_uuid")
+    cmd.add_argument("root_filesystem", nargs="?", choices=("ext4", "squashfs"), default="ext4")
     check = sub.add_parser("check-uki")
     check.add_argument("uki")
     check.add_argument("cmdline", type=Path)
@@ -137,9 +145,9 @@ def main():
     check.add_argument("initrd", type=Path)
     args = parser.parse_args()
     if args.action == "finalize":
-        finalize(args.root, args.image_urn)
+        finalize(args.root, args.image_urn, args.root_filesystem)
     elif args.action == "cmdline":
-        print(command_line(args.root_hash, args.data_uuid, args.hash_uuid))
+        print(command_line(args.root_hash, args.data_uuid, args.hash_uuid, args.root_filesystem))
     else:
         expected = {
             ".cmdline": args.cmdline.read_bytes(),

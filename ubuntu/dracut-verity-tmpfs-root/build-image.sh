@@ -2,13 +2,20 @@
 set -euo pipefail
 umask 077
 fail() { echo "BUILD_FAILED: $*" >&2; exit 1; }
-if (($# != 5)); then
-    echo 'Usage: build-image.sh SOURCE.raw PRIVATE_KEY CERTIFICATE.pem RUN_DIRECTORY KERNEL_VERSION' >&2
+if (($# < 5 || $# > 6)); then
+    echo 'Usage: build-image.sh SOURCE.raw PRIVATE_KEY CERTIFICATE.pem RUN_DIRECTORY KERNEL_VERSION [ext4|squashfs]' >&2
     exit 2
 fi
+root_filesystem=${6:-ext4}
+case "$root_filesystem" in
+    ext4) filesystem_tools=();;
+    squashfs) filesystem_tools=(mksquashfs unsquashfs);;
+    *) fail 'Root filesystem must be ext4 or squashfs';;
+esac
 recipe=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 for tool in python3 losetup lsblk udevadm mount umount rsync sgdisk mkfs.ext4 mkfs.vfat \
-    veritysetup e2fsck chroot openssl sbverify sbsign qemu-img modprobe modinfo findmnt git cargo rustc cc; do
+    veritysetup e2fsck chroot openssl sbverify sbsign qemu-img modprobe modinfo findmnt git cargo rustc cc \
+    "${filesystem_tools[@]}"; do
     command -v "$tool" >/dev/null || fail "Missing required tool: $tool"
 done
 ukify=${UKIFY:-/usr/lib/systemd/ukify}
@@ -119,14 +126,20 @@ udevadm settle
 data=$(partition "$out_loop" PARTLABEL cvm-root)
 hash=$(partition "$out_loop" PARTLABEL cvm-root-verity)
 esp=$(partition "$out_loop" PARTLABEL ESP)
-mkfs.ext4 -F -L cvm-root "$data"
 mkfs.vfat -F 32 -n CVMESP "$esp"
-mount_tracked "$data" "$run/root"
+if [[ "$root_filesystem" = squashfs ]]; then
+    truncate -s "${data_mib}M" "$run/staging.ext4"
+    mkfs.ext4 -F "$run/staging.ext4"
+    mount_tracked -o loop "$run/staging.ext4" "$run/root"
+else
+    mkfs.ext4 -F -L cvm-root "$data"
+    mount_tracked "$data" "$run/root"
+fi
 rsync -aHAX --numeric-ids --one-file-system "$run/source-root/" "$run/root/"
 if ((${#boots[@]} == 1)); then
     rsync -aHAX --numeric-ids "$run/source-boot/" "$run/root/boot/"
 fi
-python3 "$recipe/scripts/image_policy.py" finalize "$run/root" "$image_urn"
+python3 "$recipe/scripts/image_policy.py" finalize "$run/root" "$image_urn" "$root_filesystem"
 install -D -m 755 "$run/attestation-sdk/azure-guest-attest" "$run/root/usr/local/bin/azure-guest-attest"
 install -m 755 "$recipe/attest-guest.py" "$run/root/usr/local/bin/cvm-attest"
 install -m 644 "$run/attestation-sdk/build.json" "$run/root/etc/cvm-verity/attestation-sdk.json"
@@ -165,7 +178,12 @@ chroot "$run/root" apt-get -o APT::Update::Error-Mode=any update
 chroot "$run/root" apt-get install -y --no-install-recommends dracut-core systemd-boot-efi cryptsetup-bin
 install -d "$run/root/etc/cvm-verity/dracut-empty"
 chroot "$run/root" dpkg-query -W > "$run/evidence/packages.txt"
-for name in dm_verity overlay ext4 hv_vmbus hv_storvsc hv_netvsc nvme; do
+if [[ "$root_filesystem" = squashfs ]]; then
+    grep -Fxq 'CONFIG_SQUASHFS_ZLIB=y' "$run/root/boot/config-$kernel" ||
+        fail 'The source kernel must support gzip-compressed SquashFS'
+fi
+root_drivers=(dm_verity overlay "$root_filesystem" hv_vmbus hv_storvsc hv_netvsc nvme)
+for name in "${root_drivers[@]}"; do
     modprobe -C /dev/null --dirname "$run/root" --set-version "$kernel" --show-depends "$name"
 done > "$run/evidence/module-plan.txt"
 while read -r kind file rest; do
@@ -178,7 +196,7 @@ chroot "$run/root" dracut --force --no-hostonly --no-hostonly-cmdline \
     --conf /dev/null --confdir /etc/cvm-verity/dracut-empty \
     --add 'systemd systemd-initrd systemd-veritysetup dracut-systemd cvm-verity' \
     --omit 'crypt lvm mdraid resume' \
-    --add-drivers 'dm_verity overlay ext4 hv_vmbus hv_storvsc hv_netvsc nvme' \
+    --add-drivers "${root_drivers[*]}" \
     --gzip /run/cvm.initrd "$kernel"
 chroot "$run/root" lsinitrd /run/cvm.initrd > "$run/evidence/initrd-inventory.txt"
 for required in systemd-veritysetup-generator systemd-veritysetup systemd-volatile-root \
@@ -224,14 +242,26 @@ unmount_last # /sys
 unmount_last # /dev
 unmount_last # /proc
 sync
-unmount_last # root data: no more writable mounts from this point
-e2fsck -fn "$data" > "$run/evidence/fsck.txt" 2>&1
+if [[ "$root_filesystem" = squashfs ]]; then
+    mksquashfs "$run/root" "$run/root.squashfs" -noappend -comp gzip \
+        -processors 1 -no-progress -exit-on-error
+    test "$(stat -c %s "$run/root.squashfs")" -le "$((data_mib * 1024 * 1024))" ||
+        fail 'SquashFS image exceeds the data partition'
+fi
+unmount_last # finalized root: no more writable mounts from this point
+if [[ "$root_filesystem" = squashfs ]]; then
+    dd if="$run/root.squashfs" of="$data" bs=4M conv=notrunc,fsync status=none
+    unsquashfs -s "$data" > "$run/evidence/squashfs.txt"
+    rm "$run/root.squashfs" "$run/staging.ext4"
+else
+    e2fsck -fn "$data" > "$run/evidence/fsck.txt" 2>&1
+fi
 veritysetup format --hash=sha256 --data-block-size=4096 --hash-block-size=4096 \
     "$data" "$hash" > "$run/evidence/verity-format.txt"
 root_hash=$(sed -n 's/^Root hash:[[:space:]]*//p' "$run/evidence/verity-format.txt")
 data_uuid=$(lsblk -dn -o PARTUUID "$data")
 hash_uuid=$(lsblk -dn -o PARTUUID "$hash")
-python3 "$recipe/scripts/image_policy.py" cmdline "$root_hash" "$data_uuid" "$hash_uuid" > "$run/cmdline"
+python3 "$recipe/scripts/image_policy.py" cmdline "$root_hash" "$data_uuid" "$hash_uuid" "$root_filesystem" > "$run/cmdline"
 "$ukify" build --config /dev/null --linux "$run/vmlinuz" --initrd "$run/initrd" \
     --stub "$run/stub.efi" --uname "$kernel" --os-release "@$run/os-release" \
     --cmdline "@$run/cmdline" --no-sign-kernel \
@@ -251,7 +281,7 @@ losetup -d "$out_loop"
 out_loop=
 qemu-img convert -f raw -O vpc -o subformat=fixed,force_size=on "$run/image.raw" "$run/image.vhd"
 qemu-img info -f vpc --output=json "$run/image.vhd" > "$run/evidence/vhd-info.json"
-python3 - "$run" "$image_urn" "$kernel" "$root_hash" "$data_uuid" "$hash_uuid" <<'PY'
+python3 - "$run" "$image_urn" "$kernel" "$root_hash" "$data_uuid" "$hash_uuid" "$root_filesystem" <<'PY'
 import json, pathlib, struct, sys
 run = pathlib.Path(sys.argv[1])
 with (run / "image.vhd").open("rb") as stream:
@@ -267,7 +297,7 @@ if (footer[:8] != b"conectix" or struct.unpack_from(">I", footer, 60)[0] != 2
     raise ValueError("Invalid Azure fixed VHD")
 (run / "evidence/build.json").write_text(json.dumps(dict(
     imageUrn=sys.argv[2], kernel=sys.argv[3], rootHash=sys.argv[4],
-    dataPartUuid=sys.argv[5], hashPartUuid=sys.argv[6],
+    dataPartUuid=sys.argv[5], hashPartUuid=sys.argv[6], rootFilesystem=sys.argv[7],
     attestationSdk=json.loads((run / "evidence/attestation-installation.json").read_text()),
     diskQualification="NOT_RUN: full verification and corruption tests are optional qualification",
     validation="offline build only; Azure CVM acceptance required",

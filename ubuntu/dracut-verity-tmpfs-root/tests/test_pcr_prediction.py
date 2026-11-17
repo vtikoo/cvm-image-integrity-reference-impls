@@ -79,6 +79,66 @@ def synthetic_uki():
 
 
 class PredictionTests(unittest.TestCase):
+    def test_disabled_secure_boot_omits_pcr7_without_changing_image_predictions(self):
+        uki = synthetic_uki()
+        enabled = predictor.predict(uki, CERTIFICATE, load_profile(), "sysinit:ready")
+        disabled = predictor.predict(uki, CERTIFICATE, None, "sysinit:ready", secure_boot=False)
+        self.assertEqual(disabled["bootProfile"], predictor.NO_SECURE_BOOT_PROFILE)
+        self.assertEqual(disabled["pcr7Policy"], "not-evaluated")
+        self.assertEqual(set(disabled["pcrs"]), {"4", "11", "12", "13"})
+        self.assertEqual(set(disabled["events"]), {"4", "11", "12", "13"})
+        for index in disabled["pcrs"]:
+            self.assertEqual(disabled["pcrs"][index], enabled["pcrs"][index])
+            self.assertEqual(disabled["events"][index], enabled["events"][index])
+        self.assertEqual(disabled["pcr11Checkpoints"], enabled["pcr11Checkpoints"])
+        with self.assertRaisesRegex(ValueError, "requires a pinned"):
+            predictor.predict(uki, CERTIFICATE, None, "")
+        with self.assertRaisesRegex(ValueError, "does not evaluate"):
+            predictor.predict(uki, CERTIFICATE, load_profile(), "", secure_boot=False)
+
+    def test_disabled_cli_requires_signature_but_no_firmware_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "cvm.efi").write_bytes(synthetic_uki())
+            (root / "signer.der").write_bytes(CERTIFICATE)
+            args = ["predict-pcrs.py", "--disable-secure-boot", "--uki", str(root / "cvm.efi"),
+                    "--signer-der", str(root / "signer.der"), "--phase-path", "sysinit:ready"]
+            for failure in (None, ValueError("signature rejected")):
+                with self.subTest(failure=failure), mock.patch.object(sys, "argv", args), \
+                        mock.patch.object(predictor, "verify_signer", side_effect=failure) as verify, \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    if failure:
+                        with self.assertRaises(SystemExit) as caught:
+                            predictor.main()
+                        self.assertEqual(caught.exception.code, 2)
+                        self.assertEqual(output.getvalue(), "")
+                    else:
+                        predictor.main()
+                        result = json.loads(output.getvalue())
+                        self.assertNotIn("7", result["pcrs"])
+                        self.assertNotIn("firmwareBaselineSha256", result["inputs"])
+                        for index in ("12", "13"):
+                            self.assertEqual(result["pcrs"][index], "0" * 64)
+                    verify.assert_called_once_with(synthetic_uki(), CERTIFICATE)
+            for options in (
+                ["--firmware-baseline", "unused.json"],
+                ["--firmware-baseline-sha256", "0" * 64],
+            ):
+                with self.subTest(options=options), mock.patch.object(sys, "argv", args + options), \
+                        contextlib.redirect_stdout(io.StringIO()) as output, \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    predictor.main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(output.getvalue(), "")
+            for options in ([], ["--firmware-baseline", "unused.json"],
+                            ["--firmware-baseline-sha256", "0" * 64]):
+                with self.subTest(enabled_options=options), \
+                        mock.patch.object(sys, "argv", [arg for arg in args if arg != "--disable-secure-boot"] + options), \
+                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+                    predictor.main()
+                self.assertEqual(caught.exception.code, 2)
+
     def test_pcr7_serialized_efi_variable_vector_and_input_sensitivity(self):
         baseline = load_profile()
         result = predictor.predict(synthetic_uki(), CERTIFICATE, baseline, "sysinit:ready")

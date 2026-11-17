@@ -93,6 +93,26 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(INPUTS["imageUrn"], "Canonical:ubuntu-24_04-lts:cvm:24.04.202610280")
         self.assertNotIn("latest", INPUTS["imageUrn"])
 
+    def test_squashfs_policy_retains_verity_and_whole_root_overlay(self):
+        values = policy.command_line("ab" * 32, DATA_UUID, HASH_UUID, "squashfs").split()
+        self.assertIn("rootfstype=squashfs", values)
+        self.assertIn("rootflags=ro", values)
+        self.assertNotIn("rootflags=ro,noload", values)
+        self.assertIn("systemd.volatile=overlay", values)
+        self.assertIn("roothash=" + "ab" * 32, values)
+        self.assertIn("systemd.verity_root_options=panic-on-corruption", values)
+        policy.finalize(self.root, INPUTS["imageUrn"], "squashfs")
+        source = json.loads((self.root / "etc/cvm-verity/source.json").read_text())
+        self.assertEqual(source["rootFilesystem"], "squashfs")
+        self.assertIn("volatile tmpfs overlay", source["rootPolicy"])
+
+    def test_rejects_unsupported_root_filesystem(self):
+        with self.assertRaisesRegex(ValueError, "Root filesystem"):
+            policy.command_line("ab" * 32, DATA_UUID, HASH_UUID, "xfs")
+        with self.assertRaisesRegex(ValueError, "Root filesystem"):
+            policy.finalize(self.root, INPUTS["imageUrn"], "xfs")
+        self.assertFalse((self.root / "etc/cvm-verity/source.json").exists())
+
 
 class ChrootResolverTests(unittest.TestCase):
     def test_build_mounts_require_private_propagation(self):
@@ -166,7 +186,7 @@ case "$*" in
   *'FSTYPE -T'*) echo "${UPPER_FS:-tmpfs}";;
   *'TARGET -T'*'/upper/w') test "${TARGET_ERROR:-0}" = 0 || exit 1; echo "${WORK_TARGET:-/upper}";;
   *'TARGET -T'*) test "${TARGET_ERROR:-0}" = 0 || exit 1; echo /upper;;
-  *'-S /dev/mapper/root'*) echo "ext4 ${LOWER_OPTIONS:-ro,noload}";;
+  *'-S /dev/mapper/root'*) echo "${LOWER_FS:-ext4} ${LOWER_OPTIONS:-ro,noload}";;
   *) echo "Unexpected findmnt invocation: $*" >&2; exit 1;;
 esac
 """,
@@ -199,6 +219,7 @@ esac
             {"ROOT_OPTIONS": "ro,upperdir=/upper/u,workdir=/upper/w"},
             {"ROOT_OPTIONS": "rw"}, {"UPPER_FS": "ext4"}, {"UPPER_FS": "rootfs"},
             {"LOWER_OPTIONS": "rw"},
+            {"LOWER_FS": "squashfs", "LOWER_OPTIONS": "rw"}, {"LOWER_FS": "xfs"},
             {"DM_TYPE": "linear"}, {"DM_STATUS": "C"}, {"SWAP_DEVICE": "/dev/sdb1\n"},
             {"SWAP_ERROR": "1"}, {"TARGET_ERROR": "1"}, {"WORK_TARGET": "/different-tmpfs"},
         ):
@@ -207,6 +228,54 @@ esac
                 self.assertNotEqual(result.returncode, 0)
                 self.assertNotIn("CVM_ROOT_POLICY_PASSED", result.stdout)
                 self.assertIn("CVM_ROOT_POLICY_FAILED", result.stderr)
+
+    def test_accepts_read_only_squashfs_but_retains_overlay_and_verity_checks(self):
+        result = self.run_guard({"LOWER_FS": "squashfs", "LOWER_OPTIONS": "ro"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for change in ({"UPPER_FS": "ext4"}, {"DM_STATUS": "C"}, {"SWAP_DEVICE": "/dev/sdb1"}):
+            with self.subTest(change=change):
+                result = self.run_guard(dict(change, LOWER_FS="squashfs"))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("CVM_ROOT_POLICY_FAILED", result.stderr)
+
+    def test_volatile_setup_accepts_only_supported_verified_lower_filesystems(self):
+        helper = (RECIPE / "scripts/mount-volatile-root.sh").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for name, body in {
+                "findmnt": """case "$*" in
+*FSTYPE*) echo "$LOWER_FS";;
+*TARGET*) echo "$TEST_ROOT";;
+*OPTIONS*) echo "$LOWER_OPTIONS";;
+*) exit 1;;
+esac
+""",
+                "mount": 'printf "%s\\n" "$*" >> "$MOUNTS"\ncase "$*" in *--mkdir) mkdir -p "$TEST_BASE";; esac\n',
+                "umount": "exit 0\n", "ln": "exit 0\n", "cvm-check-root": "exit 0\n",
+            }.items():
+                tool = path / name
+                tool.write_text("#!/bin/bash\n" + body)
+                tool.chmod(0o755)
+            for index, (filesystem, options, accepted) in enumerate((
+                ("ext4", "ro,noload", True), ("squashfs", "ro", True),
+                ("squashfs", "rw", False), ("xfs", "ro", False),
+            )):
+                with self.subTest(filesystem=filesystem, options=options):
+                    base = path / f"overlay-{index}"
+                    script = helper.replace("base=/run/cvm-overlay", f"base={base}")
+                    script = script.replace("/usr/local/libexec/cvm-check-root", str(path / "cvm-check-root"))
+                    mounts = path / f"mounts-{index}"
+                    env = dict(os.environ, PATH=str(path) + ":" + os.environ["PATH"],
+                               LOWER_FS=filesystem, LOWER_OPTIONS=options,
+                               TEST_ROOT=str(path / "sysroot"), TEST_BASE=str(base), MOUNTS=str(mounts))
+                    result = subprocess.run(["bash", "-c", script, "test", str(path / "sysroot")],
+                                            env=env, text=True, capture_output=True)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                    if accepted:
+                        self.assertIn(f"lowerdir={base}/lower,upperdir={base}/upper,workdir={base}/work",
+                                      mounts.read_text())
+                    else:
+                        self.assertFalse(mounts.exists())
 
     def test_switch_root_requires_guard_not_just_ordering(self):
         contents = (RECIPE / "dracut/91cvm-verity/switch-root.conf").read_text()

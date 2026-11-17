@@ -8,6 +8,12 @@ export PATH="$CARGO_HOME/bin:$PATH"
 work=/var/lib/cvm-dracut
 recipe=/opt/cvm-dracut/checkout/ubuntu/dracut-verity-tmpfs-root
 fail() { echo "DRACUT_DEPLOYMENT_BUILD_FAILED: $*" >&2; exit 1; }
+root_filesystem=${2:-ext4}
+case "$root_filesystem" in
+    ext4) filesystem_packages=();;
+    squashfs) filesystem_packages=(squashfs-tools);;
+    *) fail 'Root filesystem must be ext4 or squashfs';;
+esac
 update_package_indexes() {
     local deadline=$((SECONDS + 300)) result
     while true; do
@@ -36,7 +42,8 @@ provision)
     update_package_indexes
     apt-get -o DPkg::Lock::Timeout=300 install -y --no-install-recommends \
         build-essential git python3 binutils openssl sbsigntool systemd-ukify qemu-utils \
-        rsync gdisk dosfstools e2fsprogs cryptsetup-bin util-linux udev kmod ca-certificates curl
+        rsync gdisk dosfstools e2fsprogs cryptsetup-bin util-linux udev kmod ca-certificates curl \
+        "${filesystem_packages[@]}"
     # Pin rustup itself and verify the official HTTPS-distributed binary before
     # execution. Never pipe downloaded shell code into an interpreter.
     rustup_url=https://static.rust-lang.org/rustup/archive/1.28.2/x86_64-unknown-linux-gnu/rustup-init
@@ -56,7 +63,7 @@ provision)
     ;;
 build)
     # All source and output mounts live inside a private mount namespace.
-    exec unshare --mount --propagation private bash "$0" build-private
+    exec unshare --mount --propagation private bash "$0" build-private "$root_filesystem"
     ;;
 build-private)
     test "$(findmnt -rn -o PROPAGATION -T "$work")" = private ||
@@ -138,7 +145,7 @@ PY
         -keyout "$work/signing/signer.key" -out "$work/signing/signer.pem" >/dev/null 2>&1
     chmod 600 "$work/signing/signer.key"
     bash "$recipe/build-image.sh" "$work/source.raw" "$work/signing/signer.key" \
-        "$work/signing/signer.pem" "$work/output" "$kernel"
+        "$work/signing/signer.pem" "$work/output" "$kernel" "$root_filesystem"
     grep -Fxq DRACUT_VERITY_IMAGE_BUILD_PASSED "$work/output/build.log"
     sha256sum --check "$work/output/evidence/output.sha256"
     test "$raw_hash" = "$(sha256sum "$work/source.raw" | cut -d ' ' -f1)" ||
@@ -146,7 +153,7 @@ PY
     test "$original" = "$(sha256sum "$source_disk" | cut -d ' ' -f1)" ||
         fail 'The original source changed during the build'
     sbverify --cert "$work/signing/signer.pem" "$work/output/cvm.efi"
-    python3 - "$recipe" "$work" "$original" "$raw_hash" "$kernel" <<'PY'
+    python3 - "$recipe" "$work" "$original" "$raw_hash" "$kernel" "$root_filesystem" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -168,6 +175,7 @@ record = {
     "result": "DRACUT_DEPLOYMENT_BUILD_PASSED",
     "sourceMatchesOriginal": sys.argv[3] == sys.argv[4],
     "sourceOriginalSha256": sys.argv[3], "sourceRawSha256": sys.argv[4], "kernel": sys.argv[5],
+    "rootFilesystem": sys.argv[6],
     "recipeFiles": {path.relative_to(recipe).as_posix(): sha(path) for path in sorted(files)},
     "outputs": outputs, "buildJsonSha256": sha(work / "output/evidence/build.json"),
     "sourceKernels": json.loads((work / "source-kernels.json").read_text()),

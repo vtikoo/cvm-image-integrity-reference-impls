@@ -14,7 +14,7 @@ test "$(findmnt -n -o FSTYPE -T "$work")" = tmpfs
 upper_mount=$(findmnt -n -o TARGET -T "$upper")
 work_mount=$(findmnt -n -o TARGET -T "$work")
 test "$upper_mount" = "$work_mount"
-findmnt -rn -S /dev/mapper/root -o FSTYPE,OPTIONS | grep -Eq '^ext4 (ro,|[^ ]*,ro(,|$))'
+findmnt -rn -S /dev/mapper/root -o FSTYPE,OPTIONS | grep -Eq '^(ext4|squashfs) ([^ ]*,)?ro(,|$)'
 dmsetup table root | awk '$3 == "verity" { found=1 } END { exit !found }'
 dmsetup status root | awk '$3 == "verity" && $4 == "V" { found=1 } END { exit !found }'
 swap=$(swapon --noheadings --show=NAME)

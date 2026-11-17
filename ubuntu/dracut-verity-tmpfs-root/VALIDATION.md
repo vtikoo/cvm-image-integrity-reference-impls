@@ -2,6 +2,18 @@
 
 [Recipe](README.md) | [Manual workflow](LOCAL-BUILD.md) | [Repository index](../../README.md)
 
+## Optional SquashFS lower
+
+The Azure image-build, Gallery and first-boot/reboot results below used the
+default ext4 lower. The optional SquashFS mode retains the same whole-root tmpfs
+overlay; it does not inherit Azure boot qualification from those ext4 runs.
+Local tests exercise filesystem selection, signed UKI command lines, fail-closed
+root guards, deployment forwarding and build/guest filesystem-policy matching.
+A real userspace test runs the build's gzip SquashFS packing/copy path, checks
+file metadata and rejects both partition overflow and dm-verity corruption in
+the padded data partition. These tests do not establish matching source-kernel
+driver support or a successful SquashFS CVM first boot/reboot.
+
 ## Deployment entry-point qualification
 
 The Bash and PowerShell entry points share a Python deployment/cleanup engine.
@@ -112,7 +124,7 @@ but this must not be presented as an uninterrupted one-command deployment pass.
 | Kernel/driver compatibility | Matching signed-module gates passed for original kernel `7.0.0-1016-azure-fde`; source configuration includes `CONFIG_INTEL_TDX_GUEST=y`; this kernel booted the tested Intel TDX `Standard_DC4es_v6` CVM |
 | Real live dm-verity corruption | **Passed in the complete image build**: disposable corrupted data rejected both offline verification and live mapper reads, with mapper status `C` |
 | Visible volatile-overlay backing | **Passed on the builder and actual CVM**: bind-mounted read-only lower, retained tmpfs upper/work, required initrd guard and runtime guard passed, including after a real reboot |
-| Azure signer enrollment / CVM boot | Gallery 1.0.3 replication and exact custom signer/Microsoft template readback passed; `VMGuestStateOnly` booted with Secure Boot enabled and the independently expected signer present in actual firmware db. Initial and corrected-image `NonPersistedTPM` attempts reported Compute `SecureBootClientError` |
+| Azure signer enrollment / CVM boot | Gallery 1.0.3 replication and exact custom signer/Microsoft template readback passed; `VMGuestStateOnly` booted with Secure Boot enabled and the independently expected signer present in actual firmware db |
 | First boot / workload / real reboot | **Passed**: full verity verification and firmware/kernel/hash/device/agent checks on both boots; 136 MiB and 2,051 measured tmpfs inodes; distinct reboot ID and entire workload absent |
 | Actual PCR-11 quote / MAA flow | Installed SDK failed on omitted systemd phase events; genuine combined replay matches actual PCR 11. Tmpfs-only supplemented-log diagnostic obtained a real custom-policy MAA token: signature/issuer/lifetime and signed raw values verified for `0-8,11`. PCR 12 was requested but omitted from token coverage. **Installed collector and independent expected-UKI verification remain unqualified** |
 | Native patched collector / expanded PCRs | **Passed on 2026-11-13** directly in CVM tmpfs without firmware-log bind mounts: requested exactly `0-8,11,12`; real custom-policy MAA token signature/issuer/lifetime and signed values verified for `0-8,11`; explicit missing-PCR12 warning and incomplete-coverage receipt. Full results retrieved over authenticated SSH with matching SHA256 hashes |
@@ -163,20 +175,6 @@ real-image builder probe, both actual Dracut/signed-UKI component tests, and a
 new complete Marketplace conversion passed with this change. The corrected
 image passed signed-section, live-corruption and fixed-VHD gates; version 1.0.1
 alone did not establish a successful CVM boot.
-
-The stateless attempt used the same originally published image. Its Azure
-Compute VM instance-view reported
-`ProvisioningState/failed/SecureBootClientError`, not an MAA token error.
-Neither serial nor screenshot diagnostics were available (HTTP 404), so this
-does not establish the precise rejected component, failed SKR, or a general
-incompatibility between custom UEFI certificates and `NonPersistedTPM`.
-The corrected image was published as Gallery version 1.0.1 with the unchanged
-public signer and Microsoft template. Independently retained output hashes and
-root hash matched the uploaded VHD and verified UKI. A distinct VM using this
-version, `NonPersistedTPM`, Secure Boot/vTPM and managed boot diagnostics enabled
-at creation reported the same Secure Boot error within about 20 seconds. Both
-diagnostic blobs were again unavailable. The failed target was verified
-deallocated; stateless boot and its guest/reboot/MAA qualification remain blocked.
 
 The corrected image was subsequently retried with upstream's persisted
 `VMGuestStateOnly` mode. Its serial log proves Secure Boot enabled, the expected
@@ -340,19 +338,6 @@ not pin our custom signer or expected UKI. Independent AK/quote/TEE and challeng
 binding and full expected-UKI identity checks are not implemented by this
 diagnostic; no production-complete remote image verifier is claimed.
 
-A further publication experiment explicitly set
-`publishingProfile.targetRegions[].encryption.osDiskImage.securityProfile.confidentialVMEncryptionType`
-to `NonPersistedTPM`, supported by Gallery API version 2024-03-03. Azure rejected
-this regional profile under the existing
-`TrustedLaunchAndConfidentialVmSupported` definition, requiring the
-`ConfidentialVM` feature. A separate `ConfidentialVM` definition then rejected
-custom `securityProfile.uefiSettings`, stating that UEFI customization is only
-supported for `TrustedLaunchSupported`, `ConfidentialVmSupported` or
-`TrustedLaunchAndConfidentialVmSupported`. No image with this explicit profile
-was successfully published. These API results establish the tested
-configuration constraints, not a universal claim that every stateless custom-key
-boot mechanism is unsupported.
-
 Operational evidence retrieval also exposed stale instance-view output when
 managed Run Command names were reused after deletion. The independent upload
 hash gate rejected the old build records before publication; they were
@@ -463,7 +448,23 @@ The reference was subsequently confirmed deallocated. Gallery 1.0.4, previous
 Gallery versions, the builder/signing inputs and custom endpoint remain
 retained. This qualifies the installed evidence collector on the tested image,
 not independent AK/quote/TEE authentication, fresh quote challenge binding,
-expected-UKI remote identity, stateless boot or production-complete attestation.
+expected-UKI remote identity, other deployment modes or production-complete attestation.
+
+## Secure-Boot-disabled predictor and deployment option
+
+The explicit `--disable-secure-boot` predictor mode emits PCR4/11 and conditional
+zero-PCR12/13 expectations, omitting PCR7 and firmware-baseline inputs.
+Focused tests cover CLI validation, unchanged image measurements and signature
+verification. This does not constitute a live attestation match for that profile.
+
+The deployment option of the same name (`-DisableSecureBoot` in PowerShell)
+requests Secure Boot off only for the reference VM and retains vTPM. Local
+tests cover the default-on behavior, explicit-off ARM request/readback, both
+acceptance transports and first-boot/reboot state checks. The public controller's
+disabled and ephemeral-OS-disk configurations still need end-to-end qualification.
+Existing Secure-Boot-enabled managed-disk results do not qualify those paths.
+No MAA policy checks were relaxed; authenticated PCR12/13 coverage or qualified
+input disablement remains required before remote image approval.
 
 ## Required before claiming a demonstrated configuration
 
@@ -475,7 +476,8 @@ expected-UKI remote identity, stateless boot or production-complete attestation.
 3. Boot a supported ConfidentialVM with Secure Boot, vTPM and
    `VMGuestStateOnly`; record the actual Azure image/security profile. This
    persists encrypted VMGS but does not request confidential OS-disk encryption.
-   Qualify `NonPersistedTPM` separately rather than inheriting these results.
+   Qualify optional Secure-Boot-disabled or ephemeral-OS-disk configurations
+   separately rather than inheriting these results.
 4. Run the guest verifier using independently retained build inputs. Confirm
    firmware db and live kernel/hash/device identities, healthy read-only verity
    lower, writable tmpfs overlay, no swap, usable agents and cloud-init.
